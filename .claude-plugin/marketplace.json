@@ -1,0 +1,14 @@
+{
+  "name": "dep-review",
+  "owner": {
+    "name": "a4899e"
+  },
+  "plugins": [
+    {
+      "name": "dep-review",
+      "source": "./",
+      "description": "Review PyPI and npm dependency source for supply chain attacks and prompt injection aimed at AI agents."
+    }
+  ],
+  "description": "Dependency source review for supply chain attacks and prompt injection aimed at AI agents."
+}
