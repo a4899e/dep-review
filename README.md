@@ -7,7 +7,7 @@ It looks for:
 - install-time and import-time execution: `setup.py`, `.pth` files, npm lifecycle scripts, entry-point side effects
 - credential harvesting, network exfiltration, encoded payloads, obfuscation
 - known live-campaign IOCs (`skills/dep-review/references/known-iocs.md`)
-- **text aimed at AI agents**: prompt injection telling the reviewer to find nothing, fake chat/tool markup, requests to run commands or leak secrets, hidden Unicode (tag-character smuggling, bidi overrides), and code that drives local AI CLIs with permission bypasses or plants `CLAUDE.md` / `AGENTS.md` / `.mcp.json`
+- **text aimed at AI agents**, in several languages: prompt injection telling the reviewer to find nothing, fake chat/tool markup, requests to run commands or leak secrets, hidden Unicode (tag-character smuggling, bidi overrides), and code that drives local AI CLIs with permission bypasses or plants `CLAUDE.md` / `AGENTS.md` / `.mcp.json`
 
 Packages are only ever downloaded and extracted, never installed or executed.
 
@@ -51,7 +51,7 @@ Coverage is artifact-level: a version `pass` authorises a locked dependency only
 
 ## Limits
 
-The prompt-injection scanner matches English, literal patterns. Paraphrased, translated, or runtime-assembled directives get past it, which is why the skill also tells the agent to treat all package text as untrusted data and never let it lower a verdict. An LLM reviewer can still be fooled. This tool reduces supply chain risk; it does not certify a package safe.
+The prompt-injection scanner matches literal phrases in English and seven other language groups, and surfaces any non-Latin-script prose and Latin/Cyrillic homoglyph words for the agent to read. Paraphrased directives, Latin-script languages it has no phrases for, and runtime-assembled strings still get past it, which is why the skill also tells the agent to treat all package text as untrusted data and never let it lower a verdict. An LLM reviewer can still be fooled. This tool reduces supply chain risk; it does not certify a package safe.
 
 ## Development
 
