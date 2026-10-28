@@ -87,7 +87,7 @@ sqlite3 -header "$DB" "SELECT 'version' AS level, sha256 AS id, verdict, 1 AS so
 
 Skip only when all hold, by source kind (`repo_deps.source_kind`; a single package off a registry is `registry`):
 
-- **any kind:** no row for this version, version-level or artifact, is `fail` (a failing artifact vetoes its whole release), and every reviewer on the rows you rely on is one the user trusts.
+- **any kind:** no row for this version, version-level or artifact, is `fail` (a failing artifact vetoes its whole release), no fail event for it is open (`sqlite3 "$DB" "SELECT event_id FROM fail_events e WHERE ecosystem='<ECO>' AND package='<PKG>' AND version='<VER>' AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id);"` returns nothing), and every reviewer on the rows you rely on is one the user trusts.
 - **registry:** the version row is `pass` or `partial`, and **every** artifact the lockfile admits has a `pass` row with `source_read` 1 -- compare against the lock's integrity values (repo mode: `query-artifact-gap.sh` lists exactly the missing ones).
 - **git:** the version row is `pass` (not `partial`) and its `sha256` equals the commit now locked (`repo_deps.source_ref`). Git sources have no artifact rows, so a review of another commit under the same version string proves nothing.
 

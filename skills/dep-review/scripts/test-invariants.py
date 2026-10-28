@@ -1049,6 +1049,10 @@ def test_fail_verdicts_need_resolution() -> None:
 
         conn.execute("INSERT INTO fail_resolutions SELECT MAX(event_id),'pypi','p','1','','false positive: test fixture','2026-01-03 00:00:00','alice' FROM fail_events WHERE artifact_id=''")
         conn.commit()
+        check("open artifact fail still holds the version verdict", blocked(
+            "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','pass','ok','2026-01-04 00:00:00','bob')"), True)
+        conn.execute("INSERT INTO fail_resolutions SELECT MAX(event_id),'pypi','p','1','sha256:s','fixture','2026-01-03 00:00:00','alice' FROM fail_events WHERE artifact_id='sha256:s'")
+        conn.commit()
         check("resolved fail can be replaced", blocked(
             "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','pass','ok','2026-01-04 00:00:00','bob')"), False)
         check("resolutions are append-only", blocked("DELETE FROM fail_resolutions"), True)
@@ -1238,7 +1242,7 @@ def test_upgrade_existing_database() -> None:
         return json.dumps({"ecosystem": "pypi", "package": "p", "version": "1", "sha256": "x",
                            "verdict": verdict, "notes": notes, "reviewer": "test"})
 
-    for schema in ("schema-1cb3012.sql", "schema-e9b369c.sql"):
+    for schema in ("schema-1cb3012.sql", "schema-e9b369c.sql", "schema-b337c6c.sql"):
         with tempfile.TemporaryDirectory() as d:
             db = Path(d) / "t.db"
             _old_db(db, schema)
@@ -1344,6 +1348,36 @@ def test_source_read_must_be_boolean() -> None:
                   _cli("record-review.py", Path(d) / "t.db", stdin=payload), 2)
 
 
+def test_upgrade_revokes_stale_pass() -> None:
+    """A pass reached under the old latest-event guard is not honoured after upgrade."""
+    section("upgrade revokes stale pass")
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _old_db(db, "schema-b337c6c.sql")
+        conn = sqlite3.connect(db)
+        # The sequence b337c6c allowed: A, B, resolve only B, pass.
+        conn.execute("INSERT INTO reviews VALUES ('pypi','pkg','1.0','x','fail','A: credential read','2026-01-01 00:00:00','alice')")
+        conn.execute("INSERT OR REPLACE INTO reviews VALUES ('pypi','pkg','1.0','x','fail','B: readme','2026-01-01 00:00:01','bob')")
+        conn.execute("INSERT INTO fail_resolutions VALUES (2,'pypi','pkg','1.0','','B only','2026-01-01 00:00:02','carol')")
+        conn.execute("INSERT OR REPLACE INTO reviews VALUES ('pypi','pkg','1.0','x','pass','ok','2026-01-01 00:00:03','bob')")
+        conn.execute("INSERT INTO inventory_runs (run_at,ref,expected_pairs,completed_pairs,skipped,status)"
+                     " VALUES ('2026-01-01','abc',1,1,'','complete')")
+        add_dep(conn, "pkg", "1.0", "registry")
+        add_artifact(conn, "pkg", "1.0", "sha256:a", True)
+        conn.commit()
+        conn.close()
+
+        rc, _ = run_coverage(db)
+        check("stale pass not covered", (covered_count(db), rc), (0, 1))
+        rec = json.dumps({"ecosystem": "pypi", "package": "pkg", "version": "1.0", "sha256": "x",
+                          "verdict": "pass", "notes": "ok", "reviewer": "test"})
+        check("new pass refused while A is open", _cli("record-review.py", db, stdin=rec), 1)
+        check("A can be resolved", _cli("resolve-failure.py", db, "pypi", "pkg", "1.0", "--event", "1",
+                                        "--by", "carol", stdin="A reviewed: fixture"), 0)
+        check("covered once A is resolved", covered_count(db), 1)
+        check("pass accepted once A is resolved", _cli("record-review.py", db, stdin=rec), 0)
+
+
 def main() -> None:
     test_npm_classification()
     test_uv_classification()
@@ -1376,6 +1410,7 @@ def main() -> None:
     test_resolution_names_the_reviewed_event()
     test_uv_partially_hashed_release()
     test_source_read_must_be_boolean()
+    test_upgrade_revokes_stale_pass()
 
     print()
     if FAILURES:

@@ -91,6 +91,14 @@ COVERED_SQL="
       WHEN EXISTS (SELECT 1 FROM review_artifacts a
                     WHERE a.ecosystem=d.ecosystem AND a.package=d.package
                       AND a.version=d.version AND a.verdict='fail') THEN 0
+      -- An unresolved fail event vetoes too, whatever the rows now say. A
+      -- database upgraded from an older guard can hold a pass written over a
+      -- finding nobody resolved.
+      WHEN EXISTS (SELECT 1 FROM fail_events e
+                    WHERE e.ecosystem=d.ecosystem AND e.package=d.package
+                      AND e.version=d.version
+                      AND NOT EXISTS (SELECT 1 FROM fail_resolutions f
+                                       WHERE f.fail_event_id=e.event_id)) THEN 0
       WHEN d.source_kind='local' THEN 0
       WHEN d.source_kind='git' THEN
         EXISTS (SELECT 1 FROM reviews r

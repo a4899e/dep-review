@@ -177,27 +177,29 @@ BEGIN INSERT INTO fail_events (ecosystem, package, version, artifact_id, reviewe
 
 -- BEFORE INSERT also covers INSERT OR REPLACE: it fires while the old row
 -- still exists, before the conflict deletes it.
+-- Writes are judged by open events, not by the current verdict. A database
+-- upgraded from the latest-event-only guard can hold a pass over a fail event
+-- nobody resolved; keying on the row's verdict would keep honouring it. A
+-- version-level verdict is held by open events at ANY level, since a failing
+-- artifact vetoes its whole release.
 CREATE TRIGGER reviews_keep_fail_insert
 BEFORE INSERT ON reviews
-WHEN NEW.verdict <> 'fail' AND EXISTS (
-    SELECT 1 FROM reviews r
-     WHERE r.ecosystem=NEW.ecosystem AND r.package=NEW.package AND r.version=NEW.version
-       AND r.verdict='fail'
-       AND EXISTS (SELECT 1 FROM fail_events e
-                  WHERE e.ecosystem=r.ecosystem AND e.package=r.package
-                    AND e.version=r.version AND e.artifact_id=''
-                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
+WHEN NEW.verdict <> 'fail'
+ AND EXISTS (SELECT 1 FROM fail_events e
+             WHERE e.ecosystem=NEW.ecosystem AND e.package=NEW.package AND e.version=NEW.version
+               AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER reviews_keep_fail_update
 BEFORE UPDATE ON reviews
-WHEN OLD.verdict='fail'
- AND (NEW.verdict <> 'fail' OR NEW.ecosystem IS NOT OLD.ecosystem
-      OR NEW.package IS NOT OLD.package OR NEW.version IS NOT OLD.version)
- AND EXISTS (SELECT 1 FROM fail_events e
-                  WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
-                    AND e.version=OLD.version AND e.artifact_id=''
-                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
+WHEN (NEW.verdict <> 'fail'
+      AND EXISTS (SELECT 1 FROM fail_events e
+             WHERE e.ecosystem=NEW.ecosystem AND e.package=NEW.package AND e.version=NEW.version
+               AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
+  OR ((NEW.ecosystem IS NOT OLD.ecosystem OR NEW.package IS NOT OLD.package OR NEW.version IS NOT OLD.version)
+      AND EXISTS (SELECT 1 FROM fail_events e
+             WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package AND e.version=OLD.version
+               AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER reviews_keep_fail_delete
@@ -211,25 +213,23 @@ BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict: a human must resolve it with
 
 CREATE TRIGGER review_artifacts_keep_fail_insert
 BEFORE INSERT ON review_artifacts
-WHEN NEW.verdict <> 'fail' AND EXISTS (
-    SELECT 1 FROM review_artifacts r
-     WHERE r.ecosystem=NEW.ecosystem AND r.package=NEW.package AND r.version=NEW.version
-       AND r.artifact_id=NEW.artifact_id AND r.verdict='fail'
-       AND EXISTS (SELECT 1 FROM fail_events e
-                  WHERE e.ecosystem=r.ecosystem AND e.package=r.package
-                    AND e.version=r.version AND e.artifact_id=r.artifact_id
-                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
+WHEN NEW.verdict <> 'fail'
+ AND EXISTS (SELECT 1 FROM fail_events e
+             WHERE e.ecosystem=NEW.ecosystem AND e.package=NEW.package AND e.version=NEW.version AND e.artifact_id=NEW.artifact_id
+               AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict on artifact: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER review_artifacts_keep_fail_update
 BEFORE UPDATE ON review_artifacts
-WHEN OLD.verdict='fail'
- AND (NEW.verdict <> 'fail' OR NEW.ecosystem IS NOT OLD.ecosystem OR NEW.package IS NOT OLD.package
-      OR NEW.version IS NOT OLD.version OR NEW.artifact_id IS NOT OLD.artifact_id)
- AND EXISTS (SELECT 1 FROM fail_events e
-                  WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
-                    AND e.version=OLD.version AND e.artifact_id=OLD.artifact_id
-                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
+WHEN (NEW.verdict <> 'fail'
+      AND EXISTS (SELECT 1 FROM fail_events e
+             WHERE e.ecosystem=NEW.ecosystem AND e.package=NEW.package AND e.version=NEW.version AND e.artifact_id=NEW.artifact_id
+               AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
+  OR ((NEW.ecosystem IS NOT OLD.ecosystem OR NEW.package IS NOT OLD.package
+       OR NEW.version IS NOT OLD.version OR NEW.artifact_id IS NOT OLD.artifact_id)
+      AND EXISTS (SELECT 1 FROM fail_events e
+             WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package AND e.version=OLD.version AND e.artifact_id=OLD.artifact_id
+               AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict on artifact: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER review_artifacts_keep_fail_delete

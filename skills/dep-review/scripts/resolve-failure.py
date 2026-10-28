@@ -70,14 +70,6 @@ def main() -> int:
     conn = sqlite3.connect(rr.db_path())
     try:
         conn.executescript(rr.SCHEMA.read_text())
-        table, extra = ("review_artifacts", " AND artifact_id=?") if args.artifact else ("reviews", "")
-        params = (args.ecosystem, args.package, args.version) + ((args.artifact,) if args.artifact else ())
-        found = conn.execute(
-            f"SELECT verdict FROM {table} WHERE ecosystem=? AND package=? AND version=?{extra}", params
-        ).fetchone()
-        if not found or found[0] != "fail":
-            print("no fail verdict to resolve for that key", file=sys.stderr)
-            return 1
         open_events = {row[0] for row in conn.execute(
             "SELECT e.event_id FROM fail_events e WHERE e.ecosystem=? AND e.package=? AND e.version=?"
             " AND e.artifact_id=? AND NOT EXISTS (SELECT 1 FROM fail_resolutions f"
