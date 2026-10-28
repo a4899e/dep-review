@@ -170,7 +170,7 @@ echo "  inventory rows modified: ${I_MODIFIED}"
 # failure_resolutions clears a fail veto, so a new row here can authorise a
 # package with no review row touched. Rows are compared whole: the table is
 # append-only, so any difference is an addition or a removal.
-FKEY="b.ecosystem IS r.ecosystem AND b.package IS r.package AND b.version IS r.version AND b.artifact_id IS r.artifact_id AND b.resolution IS r.resolution AND b.resolved_at IS r.resolved_at AND b.resolved_by IS r.resolved_by"
+FKEY="b.fail_event_id IS r.fail_event_id AND b.ecosystem IS r.ecosystem AND b.package IS r.package AND b.version IS r.version AND b.artifact_id IS r.artifact_id AND b.resolution IS r.resolution AND b.resolved_at IS r.resolved_at AND b.resolved_by IS r.resolved_by"
 HAS_F=$(sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='failure_resolutions';")
 HAS_F_BASE=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='failure_resolutions';")
 F_ADDED=0; F_REMOVED=0

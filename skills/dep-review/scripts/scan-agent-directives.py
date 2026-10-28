@@ -24,6 +24,7 @@ Exit:  0 no hits, 1 hits found, 2 usage error, 3 no hits but some files unreadab
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import unicodedata
@@ -315,10 +316,20 @@ def main() -> int:
         return 2
 
     hits: dict[str, list[str]] = defaultdict(list)
-    for path in sorted(args.dir.rglob("*")):
-        if not path.is_file() or path.is_symlink() or SKIP_DIRS & set(path.parts):
-            continue
-        scan_file(path, str(path.relative_to(args.dir)), hits)
+
+    # os.walk with onerror, not rglob: rglob silently omits a subtree it
+    # cannot list, which reads as a clean scan of files nobody looked at.
+    def unreadable(e: OSError) -> None:
+        rel = Path(e.filename).relative_to(args.dir) if e.filename else "?"
+        hits["scan-incomplete"].append(f"{rel}/:0\tdirectory not scanned: {e.strerror or e}")
+
+    for root, dirs, files in os.walk(args.dir, onerror=unreadable):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for name in sorted(files):
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            scan_file(path, str(path.relative_to(args.dir)), hits)
 
     if not hits:
         print("no agent-directed text found")
@@ -334,6 +345,8 @@ def main() -> int:
             print(f"{cat}\t{row}")
         if len(rows) > args.max_per_category:
             print(f"{cat}\t...\t{len(rows) - args.max_per_category} more not shown")
+    if "scan-incomplete" in hits:
+        print("the scan is also INCOMPLETE: see scan-incomplete rows; those paths were not read")
     return 1
 
 

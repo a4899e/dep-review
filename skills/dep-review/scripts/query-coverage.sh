@@ -100,7 +100,9 @@ COVERED_SQL="
       -- Registry. Needs BOTH: a version-level review that is not a fail (that
       -- row is where the source review lives), and complete artifact evidence.
       -- 'partial' is accepted here and only here -- it means some artifacts were
-      -- unreviewed, which complete artifact rows have since answered.
+      -- unreviewed, which complete artifact rows have since answered. An
+      -- artifact pass counts only with source_read=1: a pass on bytes nobody
+      -- read (a prebuilt native binary) is a provenance claim, not a review.
       WHEN EXISTS (SELECT 1 FROM repo_dep_artifacts x
                     WHERE x.repo=d.repo AND x.ecosystem=d.ecosystem
                       AND x.package=d.package AND x.version=d.version) THEN
@@ -115,7 +117,7 @@ COVERED_SQL="
                SELECT 1 FROM review_artifacts ra
                 WHERE ra.ecosystem=x.ecosystem AND ra.package=x.package
                   AND ra.version=x.version AND ra.artifact_id=x.artifact_id
-                  AND ra.verdict='pass'))
+                  AND ra.verdict='pass' AND ra.source_read=1))
       -- Remote, but no artifact identity was extracted. Previously this shape
       -- was read as first-party and skipped the gate entirely. It is an
       -- inventory defect, and it reads as uncovered.

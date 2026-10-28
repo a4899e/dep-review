@@ -32,6 +32,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -416,12 +417,34 @@ def parse_requirements(repo_dir: Path, lockpath: Path) -> list[tuple[str, str, i
 
 
 # Global options that change where pip looks, not what it installs. Hashes
-# still pin the bytes, so they do not affect the inventory.
-_REQ_OPTIONS = {
-    "-i", "--index-url", "--extra-index-url", "--no-index", "-f", "--find-links",
-    "--require-hashes", "--pre", "--trusted-host", "--prefer-binary",
-    "--only-binary", "--no-binary",
+# still pin the bytes, so they do not affect the inventory. Split by arity so
+# every token on an option line can be accounted for.
+_REQ_OPTIONS_WITH_ARG = {
+    "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
+    "--trusted-host", "--only-binary", "--no-binary",
 }
+_REQ_FLAGS = {"--no-index", "--require-hashes", "--pre", "--prefer-binary"}
+
+
+def _check_option_line(line: str) -> None:
+    """Raise unless every token on *line* is an allowed option and its argument.
+
+    pip accepts several options on one line, so checking only the first let
+    ``--index-url URL -r hidden.txt`` hide an include behind an allowed option.
+    """
+    tokens = shlex.split(line)
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        name, eq, _ = tok.partition("=")
+        if name in _REQ_FLAGS and not eq:
+            i += 1
+        elif name in _REQ_OPTIONS_WITH_ARG and eq:
+            i += 1
+        elif tok in _REQ_OPTIONS_WITH_ARG and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            i += 2
+        else:
+            raise ValueError(f"unsupported requirements line: {line[:120]!r}")
 _REQ_PIN = re.compile(
     r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[A-Za-z0-9._,\s-]*\])?"
     r"\s*==\s*([A-Za-z0-9._+!-]+)\s*(?:;.*)?$"
@@ -464,9 +487,7 @@ def requirements_entries(text: str) -> dict[tuple[str, str], tuple[list[str], bo
             continue
         line = re.sub(r"\s+#.*$", "", line)
         if line.startswith("-"):
-            option = re.split(r"[\s=]", line, maxsplit=1)[0]
-            if option not in _REQ_OPTIONS:
-                raise ValueError(f"unsupported requirements line: {line[:120]!r}")
+            _check_option_line(line)
             continue
         hashes = _REQ_HASH.findall(line)
         spec = _REQ_HASH.sub("", line).strip()
@@ -756,6 +777,70 @@ def artifacts_pnpm(
     return out
 
 
+# A remote copy with no hash. Another copy of the same name@version that does
+# carry a hash says nothing about this one's bytes, so any key here keeps NO
+# artifact rows and reads as uncovered (no_artifact) rather than being vouched
+# for by a hashed sibling in the same lock or another lock.
+def unbound_npm(lock_path: Path) -> set[tuple[str, str]]:
+    """Registry-sourced package-lock entries that carry no integrity."""
+    out: set[tuple[str, str]] = set()
+    for path, info in _load_npm_lock(lock_path).get("packages", {}).items():
+        name = path.split("node_modules/")[-1]
+        if not path or "node_modules/" in name or not info.get("version"):
+            continue
+        resolved = info.get("resolved") or ""
+        remote = not (resolved.startswith(("git+", "git:", "file:")) or info.get("link") is True)
+        if remote and not info.get("integrity"):
+            out.add((name, info["version"]))
+    return out
+
+
+def unbound_uv(lock_path: Path) -> set[tuple[str, str]]:
+    """Registry-sourced uv.lock entries with neither an sdist nor a wheel hash."""
+    with lock_path.open("rb") as f:
+        lock = tomllib.load(f)
+    out: set[tuple[str, str]] = set()
+    for pkg in lock.get("package", []):
+        src = pkg.get("source", {}) or {}
+        if any(k in src for k in ("git", "editable", "virtual", "directory", "path")):
+            continue
+        sdist = pkg.get("sdist")
+        hashed = (isinstance(sdist, dict) and sdist.get("hash")) or any(
+            isinstance(w, dict) and w.get("hash") for w in pkg.get("wheels", []) or []
+        )
+        if pkg.get("name") and pkg.get("version") and not hashed:
+            out.add((pkg["name"].lower().replace("_", "-"), pkg["version"]))
+    return out
+
+
+def unbound_pnpm(lock_path: Path) -> set[tuple[str, str]]:
+    """pnpm-lock ``packages:`` entries (all remote) whose block has no integrity."""
+    out: set[tuple[str, str]] = set()
+    current: tuple[str, str] | None = None
+    bound = False
+    in_packages = False
+    for line in lock_path.read_text().splitlines() + ["END:"]:
+        if line == "packages:":
+            in_packages = True
+            continue
+        if not in_packages:
+            continue
+        top = line and not line.startswith(" ")
+        entry = line.startswith("  ") and not line.startswith("    ") and line.rstrip().endswith(":")
+        if top or entry:
+            if current and not bound:
+                out.add(current)
+            current, bound = None, False
+            if top:
+                break
+            key = line.strip().rstrip(":").strip("'\"").split("(", 1)[0]
+            name, _, version = key.rpartition("@") if key.startswith("@") else key.partition("@")
+            current = (name, version) if name and version else None
+        elif "integrity:" in line:
+            bound = True
+    return out
+
+
 def source_kinds_uv(lock_path: Path) -> dict[tuple[str, str], str]:
     """Map (package, version) -> 'registry' | 'git' | 'local' from uv.lock.
 
@@ -879,20 +964,21 @@ def _basename(url: str) -> str:
 
 def _read_lock(
     repo: str, lockname: str, tmp: Path
-) -> tuple[list, dict, dict, dict]:
-    """Parse one materialised lock into (rows, source_refs, artifacts, kinds)."""
+) -> tuple[list, dict, dict, dict, set]:
+    """Parse one materialised lock into (rows, source_refs, artifacts, kinds, unbound)."""
     # Dispatch on the basename, not the whole relative path: a nested lock such
     # as infra/cdk/package-lock.json must still route to the npm parser rather
     # than falling through to parse_uv.
     kind = Path(lockname).name
     lock = tmp / lockname
     if kind == "package-lock.json":
-        return parse_npm(tmp, lock), npm_source_refs(lock), artifacts_npm(lock), source_kinds_npm(lock)
+        return (parse_npm(tmp, lock), npm_source_refs(lock), artifacts_npm(lock),
+                source_kinds_npm(lock), unbound_npm(lock))
     if kind == "pnpm-lock.yaml":
         # pnpm records a git dependency's commit in the package key rather than
         # a resolved URL; not extracted yet, so such a dependency stays
         # uncovered rather than wrongly covered.
-        return parse_pnpm(tmp), {}, artifacts_pnpm(lock), source_kinds_pnpm(lock)
+        return parse_pnpm(tmp), {}, artifacts_pnpm(lock), source_kinds_pnpm(lock), unbound_pnpm(lock)
     if kind.endswith(".txt"):
         manifest = MANIFESTS.get((repo, lockname))
         if manifest is None:
@@ -901,14 +987,17 @@ def _read_lock(
                 "pip lock cannot name its artifacts without one"
             )
         rows = parse_requirements(tmp, lock)
+        arts = artifacts_requirements(lock, Path(manifest))
         return (
             rows,
             {},
-            artifacts_requirements(lock, Path(manifest)),
+            arts,
             {(r[0], r[1]): "registry" for r in rows},
+            {k for k, items in arts.items() if not items},
         )
     if kind == "uv.lock":
-        return parse_uv(tmp), git_source_refs(lock), artifacts_uv(lock), source_kinds_uv(lock)
+        return (parse_uv(tmp), git_source_refs(lock), artifacts_uv(lock),
+                source_kinds_uv(lock), unbound_uv(lock))
     raise ValueError(f"unsupported lockfile {lockname}")
 
 
@@ -924,6 +1013,7 @@ def _read_group(
     refs: dict[tuple[str, str], str] = {}
     artifacts: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
     kinds: dict[tuple[str, str], str] = {}
+    unbound: set[tuple[str, str]] = set()
     for lockname in locknames:
         tmp = Path(tempfile.mkdtemp(prefix="repo-deps-"))
         try:
@@ -933,7 +1023,7 @@ def _read_group(
             if not materialise(repo_dir, snapshot_ref, wanted, tmp):
                 raise FileNotFoundError(f"no {lockname} at {snapshot_ref[:8]}")
             # Must happen here: the finally below removes tmp.
-            l_rows, l_refs, l_arts, l_kinds = _read_lock(repo, lockname, tmp)
+            l_rows, l_refs, l_arts, l_kinds, l_unbound = _read_lock(repo, lockname, tmp)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         for n, v, d, t in l_rows:
@@ -949,6 +1039,9 @@ def _read_group(
             bucket.extend(i for i in items if i not in bucket)
         for key, kind in l_kinds.items():
             _merge_kind(kinds, key, kind)
+        unbound |= l_unbound
+    for key in unbound:
+        artifacts.pop(key, None)
     return [(n, v, d, t) for (n, v), (d, t) in rows.items()], refs, artifacts, kinds
 
 

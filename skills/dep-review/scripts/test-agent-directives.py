@@ -125,6 +125,24 @@ def coverage_cases() -> list[str]:
         out.append(f"long ASCII tokens took {elapsed:.1f}s (expected linear time)")
     if os.geteuid() != 0:
         with tempfile.TemporaryDirectory() as d:
+            sub = Path(d) / "dist"
+            sub.mkdir()
+            (sub / "helper.js").write_bytes(phrase)
+            sub.chmod(0)
+            proc = subprocess.run([sys.executable, str(SCANNER), d], capture_output=True, text=True, check=False)
+            sub.chmod(0o700)
+        if proc.returncode != 3 or "scan-incomplete" not in proc.stdout:
+            out.append(f"unreadable directory not reported incomplete (exit {proc.returncode})")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.js").write_bytes(phrase)
+            sub = Path(d) / "dist"
+            sub.mkdir()
+            sub.chmod(0)
+            proc = subprocess.run([sys.executable, str(SCANNER), d], capture_output=True, text=True, check=False)
+            sub.chmod(0o700)
+        if "INCOMPLETE" not in proc.stdout:
+            out.append("hits plus an unreadable directory: incompleteness not stated")
+        with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "locked.js"
             p.write_bytes(b"x")
             p.chmod(0)

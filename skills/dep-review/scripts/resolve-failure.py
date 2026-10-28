@@ -49,15 +49,27 @@ def main() -> int:
         if not found or found[0] != "fail":
             print("no fail verdict to resolve for that key", file=sys.stderr)
             return 1
+        # The resolution names the latest fail event, so it cannot also clear a
+        # fail recorded after it.
+        event = conn.execute(
+            "SELECT MAX(event_id) FROM fail_events WHERE ecosystem=? AND package=? AND version=?"
+            " AND artifact_id=?",
+            (args.ecosystem, args.package, args.version, args.artifact),
+        ).fetchone()[0]
         now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S")
-        with conn:
-            conn.execute(
-                "INSERT INTO failure_resolutions VALUES (?,?,?,?,?,?,?)",
-                (args.ecosystem, args.package, args.version, args.artifact, reason, now, args.by),
-            )
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO failure_resolutions (fail_event_id, ecosystem, package, version,"
+                    " artifact_id, resolution, resolved_at, resolved_by) VALUES (?,?,?,?,?,?,?,?)",
+                    (event, args.ecosystem, args.package, args.version, args.artifact, reason, now, args.by),
+                )
+        except sqlite3.IntegrityError as e:
+            print(f"refused: {e} (already resolved?)", file=sys.stderr)
+            return 1
     finally:
         conn.close()
-    print(f"resolved; {args.package} {args.version} may now be re-reviewed")
+    print(f"resolved fail event {event}; {args.package} {args.version} may now be re-reviewed")
     return 0
 
 

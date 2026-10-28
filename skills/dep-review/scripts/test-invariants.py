@@ -646,7 +646,7 @@ def test_audit_detects() -> None:
         ("drop the artifact evidence table", "DROP TABLE review_artifacts"),
         (
             "add a failure resolution (clears a veto)",
-            "INSERT INTO failure_resolutions VALUES ('pypi','pkg','1.0','','x','t','y')",
+            "INSERT INTO failure_resolutions VALUES (1,'pypi','pkg','1.0','','x','t','y')",
         ),
         ("drop the admitted-artifact inventory", "DROP TABLE repo_dep_artifacts"),
         (
@@ -1037,7 +1037,7 @@ def test_fail_verdicts_need_resolution() -> None:
         check("fail -> fail still allowed", blocked(
             "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','fail','more','2026-01-02 00:00:00','bob')"), False)
 
-        conn.execute("INSERT INTO failure_resolutions VALUES ('pypi','p','1','','false positive: test fixture','2026-01-03 00:00:00','alice')")
+        conn.execute("INSERT INTO failure_resolutions SELECT MAX(event_id),'pypi','p','1','','false positive: test fixture','2026-01-03 00:00:00','alice' FROM fail_events WHERE artifact_id=''")
         conn.commit()
         check("resolved fail can be replaced", blocked(
             "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','pass','ok','2026-01-04 00:00:00','bob')"), False)
@@ -1093,6 +1093,126 @@ def test_record_review_is_inert() -> None:
         check("cannot pass over an unresolved fail", proc.returncode != 0, True)
 
 
+def _cli(script: str, db: Path, *args: str, stdin: str = "") -> int:
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS / script), *args], input=stdin, text=True,
+        capture_output=True, env=dict(os.environ, DEP_REVIEW_DB=str(db)), check=False,
+    ).returncode
+
+
+def test_resolution_binds_to_one_fail() -> None:
+    """A resolution clears the fail it answered, not a later fail in the same second."""
+    section("resolution identity")
+
+    def rec(verdict: str, notes: str) -> str:
+        return json.dumps({"ecosystem": "pypi", "package": "p", "version": "1", "sha256": "x",
+                           "verdict": verdict, "notes": notes, "reviewer": "test"})
+
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        check("fail A recorded", _cli("record-review.py", db, stdin=rec("fail", "A")), 0)
+        check("A resolved", _cli("resolve-failure.py", db, "pypi", "p", "1", "--by", "alice",
+                                 stdin="A was a fixture"), 0)
+        check("fail B recorded", _cli("record-review.py", db, stdin=rec("fail", "B")), 0)
+        check("pass over unresolved B refused",
+              _cli("record-review.py", db, stdin=rec("pass", "ok")), 1)
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _cli("record-review.py", db, stdin=rec("fail", "A"))
+        _cli("resolve-failure.py", db, "pypi", "p", "1", "--by", "alice", stdin="fixture")
+        check("same-second resolve then pass allowed",
+              _cli("record-review.py", db, stdin=rec("pass", "ok")), 0)
+
+
+def test_requirements_option_lines() -> None:
+    """Every option on an option line is validated, not just the first."""
+    section("requirements option lines")
+    with tempfile.TemporaryDirectory() as d:
+        req = Path(d) / "r.txt"
+        for bad in ("--index-url https://pypi.org/simple -r hidden.txt",
+                    "--pre -r hidden.txt", "-i https://x --extra-index-url https://y -c c.txt",
+                    "--no-index foo==1.0", "--index-url=https://x -e .",
+                    "--trusted-host"):
+            req.write_text(bad + "\n")
+            try:
+                bf.parse_requirements(Path(d), req)
+                raised = False
+            except ValueError:
+                raised = True
+            check(f"rejects {bad!r}", raised, True)
+        req.write_text("--index-url https://pypi.org/simple --extra-index-url=https://x/simple\n"
+                       "-i https://a --no-binary :all: --require-hashes --pre\n")
+        check("allowed options together parse", bf.parse_requirements(Path(d), req), [])
+
+
+def test_unbound_copy_blocks_merge() -> None:
+    """A hashed copy of name@version must not vouch for an unhashed remote copy."""
+    section("unbound remote copies")
+    unhashed = {"version": "1.0.0", "resolved": "https://elsewhere.example/dep-1.0.0.tgz"}
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        repo = root / "fakerepo"
+        (repo / "tools").mkdir(parents=True)
+        (repo / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {
+            "": {}, "node_modules/dep": _npm_pkg("1.0.0", "sha512-H")}}))
+        (repo / "tools" / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {
+            "": {}, "node_modules/dep": unhashed}}))
+        _git_repo(repo)
+        conn = sqlite3.connect(root / "t.db")
+        conn.executescript(SCHEMA_SRC.read_text())
+        orig = bf.REPO_ROOT, bf.LOCKFILES, bf.REPO_PATHS
+        try:
+            bf.REPO_ROOT, bf.REPO_PATHS = root, {}
+            bf.LOCKFILES = [("fakerepo", "npm", "package-lock.json"),
+                            ("fakerepo", "npm", "tools/package-lock.json")]
+            bf.backfill(conn, "HEAD")
+        finally:
+            bf.REPO_ROOT, bf.LOCKFILES, bf.REPO_PATHS = orig
+        arts = [r[0] for r in conn.execute("SELECT artifact_id FROM repo_dep_artifacts WHERE package='dep'")]
+        conn.close()
+        check("across locks: no artifact vouches for the unhashed copy", arts, [])
+
+        lock = root / "one.json"
+        lock.write_text(json.dumps({"lockfileVersion": 3, "packages": {
+            "": {}, "node_modules/dep": _npm_pkg("1.0.0", "sha512-H"),
+            "node_modules/x/node_modules/dep": unhashed}}))
+        check("within one lock: unbound reported", ("dep", "1.0.0") in bf.unbound_npm(lock), True)
+
+
+def test_unread_artifact_never_covers() -> None:
+    """An artifact whose source was not read cannot pass, at write time or in coverage."""
+    section("unread artifacts")
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        conn = build_db(db)
+        add_dep(conn, "pkg", "1.0", "registry")
+        add_review(conn, "pkg", "1.0", "partial")
+        conn.execute("INSERT INTO repo_dep_artifacts VALUES ('r1','pypi','pkg','1.0','sha256:n','n.whl','wheel')")
+        conn.execute("INSERT INTO review_artifacts VALUES ('pypi','pkg','1.0','sha256:n','n.whl','wheel',0,'pass','native','t','test')")
+        conn.commit()
+        conn.close()
+        check("source_read=0 pass does not cover", covered_count(db), 0)
+    with tempfile.TemporaryDirectory() as d:
+        payload = json.dumps({
+            "ecosystem": "pypi", "package": "pkg", "version": "1.0", "sha256": "x",
+            "verdict": "partial", "notes": "n", "reviewer": "test",
+            "artifacts": [{"artifact_id": "sha256:n", "artifact_name": "n.whl",
+                           "artifact_kind": "wheel", "source_read": False,
+                           "verdict": "pass", "notes": "native"}]})
+        check("writer refuses an unread pass",
+              _cli("record-review.py", Path(d) / "t.db", stdin=payload), 2)
+
+
+def test_skill_doc_contract() -> None:
+    """The documented record shape must be one the writer accepts."""
+    section("SKILL.md contract")
+    doc = (REPO / "SKILL.md").read_text()
+    block = doc.split("```json", 1)[1].split("```", 1)[0]
+    check("JSON example names a reviewer", '"reviewer"' in block, True)
+    step2 = doc.split("### Step 2", 1)[1].split("### Step 3", 1)[0]
+    check("cache check reads the reviewed commit", "sha256" in step2 and "source_ref" in step2, True)
+
+
 def main() -> None:
     test_npm_classification()
     test_uv_classification()
@@ -1116,6 +1236,11 @@ def main() -> None:
     test_fail_verdicts_need_resolution()
     test_artifact_fail_vetoes_release()
     test_record_review_is_inert()
+    test_resolution_binds_to_one_fail()
+    test_requirements_option_lines()
+    test_unbound_copy_blocks_merge()
+    test_unread_artifact_never_covers()
+    test_skill_doc_contract()
 
     print()
     if FAILURES:

@@ -69,7 +69,7 @@ FROM repo_dep_artifacts a
 LEFT JOIN review_artifacts ra
        ON ra.ecosystem = a.ecosystem AND ra.package = a.package
       AND ra.version = a.version AND ra.artifact_id = a.artifact_id
-      AND ra.verdict = 'pass'
+      AND ra.verdict = 'pass' AND ra.source_read = 1
 LEFT JOIN reviews v
        ON v.ecosystem = a.ecosystem AND v.package = a.package AND v.version = a.version
 GROUP BY a.ecosystem, a.package, a.version
@@ -85,7 +85,7 @@ SELECT COUNT(*) FROM (
   SELECT 1 FROM repo_dep_artifacts a
   LEFT JOIN review_artifacts ra
          ON ra.ecosystem=a.ecosystem AND ra.package=a.package
-        AND ra.version=a.version AND ra.artifact_id=a.artifact_id AND ra.verdict='pass'
+        AND ra.version=a.version AND ra.artifact_id=a.artifact_id AND ra.verdict='pass' AND ra.source_read=1
   GROUP BY a.ecosystem,a.package,a.version
   HAVING COUNT(DISTINCT CASE WHEN ra.artifact_id IS NOT NULL THEN a.artifact_id END)
        < COUNT(DISTINCT a.artifact_id));")
@@ -102,7 +102,7 @@ SELECT COUNT(*) FROM (
                 AND v.version=a.version AND v.verdict='pass'
   LEFT JOIN review_artifacts ra
          ON ra.ecosystem=a.ecosystem AND ra.package=a.package
-        AND ra.version=a.version AND ra.artifact_id=a.artifact_id AND ra.verdict='pass'
+        AND ra.version=a.version AND ra.artifact_id=a.artifact_id AND ra.verdict='pass' AND ra.source_read=1
   GROUP BY a.ecosystem,a.package,a.version
   HAVING COUNT(DISTINCT CASE WHEN ra.artifact_id IS NOT NULL THEN a.artifact_id END)
        < COUNT(DISTINCT a.artifact_id));")

@@ -41,7 +41,7 @@ Requires Python 3.11+, `sqlite3`, `jq`, `curl`, `git`; `ripgrep` recommended.
 |---|---|---|
 | Database | `${XDG_DATA_HOME:-~/.local/share}/dep-review/reviews.db` | `DEP_REVIEW_DB` (or `DEP_REVIEW_HOME` for the directory) |
 | Repo registry | `<home>/repos.json` | `DEP_REVIEW_CONFIG` |
-| Reviewer name | agent name | `DEP_REVIEW_REVIEWER` |
+| Reviewer name | none; required per record | `"reviewer"` in the record, or `DEP_REVIEW_REVIEWER` |
 
 The schema (`skills/dep-review/scripts/schema.sql`) is applied idempotently, so pointing at an existing database reuses its reviews and a new path starts empty.
 

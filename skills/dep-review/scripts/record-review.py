@@ -22,7 +22,7 @@ Input::
       "reviewer": "claude",                  # optional; else $DEP_REVIEW_REVIEWER
       "artifacts": [                          # every artifact actually inspected
         {"artifact_id": "sha512-...", "artifact_name": "left-pad-1.3.0.tgz",
-         "artifact_kind": "sdist|wheel|tarball|binary", "source_read": true,
+         "artifact_kind": "sdist|wheel|tarball|binary", "source_read": true,  # must be true to pass
          "verdict": "pass" | "fail", "notes": "..."}
       ]
     }
@@ -94,6 +94,11 @@ def main() -> int:
                 1 if a.get("source_read") else 0,
                 need(a, "verdict", ARTIFACT_VERDICTS), need(a, "notes"),
             ))
+        if any(r[7] == "pass" and not r[6] for r in art_rows):
+            raise ValueError(
+                "artifact 'pass' with source_read false: bytes you could not read cannot pass;"
+                " leave that artifact out (it stays uncovered) and record the version 'partial'"
+            )
         if verdict == "pass" and any(r[7] == "fail" for r in art_rows):
             raise ValueError("verdict 'pass' with a failing artifact; the release fails")
     except (ValueError, json.JSONDecodeError, OSError) as e:
