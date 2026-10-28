@@ -87,11 +87,15 @@ def main() -> int:
             raise ValueError("'artifacts' must be a list")
         art_rows = []
         for a in arts:
+            # A JSON boolean, never coerced: "false" or {"read": false} is
+            # truthy in Python and would become evidence that bytes were read.
+            if not isinstance(a.get("source_read"), bool):
+                raise ValueError("artifact 'source_read' must be JSON true or false")
             art_rows.append((
                 eco, pkg, ver,
                 need(a, "artifact_id"), need(a, "artifact_name"),
                 need(a, "artifact_kind", KINDS),
-                1 if a.get("source_read") else 0,
+                1 if a["source_read"] else 0,
                 need(a, "verdict", ARTIFACT_VERDICTS), need(a, "notes"),
             ))
         if any(r[7] == "pass" and not r[6] for r in art_rows):

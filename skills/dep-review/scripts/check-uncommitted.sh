@@ -167,26 +167,37 @@ echo "  inventory rows added:    ${I_ADDED}"
 echo "  inventory rows removed:  ${I_REMOVED}"
 echo "  inventory rows modified: ${I_MODIFIED}"
 
-# failure_resolutions clears a fail veto, so a new row here can authorise a
-# package with no review row touched. Rows are compared whole: the table is
-# append-only, so any difference is an addition or a removal.
-FKEY="b.fail_event_id IS r.fail_event_id AND b.ecosystem IS r.ecosystem AND b.package IS r.package AND b.version IS r.version AND b.artifact_id IS r.artifact_id AND b.resolution IS r.resolution AND b.resolved_at IS r.resolved_at AND b.resolved_by IS r.resolved_by"
-HAS_F=$(sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='failure_resolutions';")
-HAS_F_BASE=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='failure_resolutions';")
-F_ADDED=0; F_REMOVED=0
-if [[ "$HAS_F" == "1" && "$HAS_F_BASE" == "1" ]]; then
-    F_ADDED=$(count "SELECT COUNT(*) FROM failure_resolutions r
-      WHERE NOT EXISTS (SELECT 1 FROM b.failure_resolutions b WHERE ${FKEY});")
-    F_REMOVED=$(count "SELECT COUNT(*) FROM b.failure_resolutions b
-      WHERE NOT EXISTS (SELECT 1 FROM failure_resolutions r WHERE ${FKEY});")
-elif [[ "$HAS_F" == "1" ]]; then
-    F_ADDED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM failure_resolutions;")
-elif [[ "$HAS_F_BASE" == "1" ]]; then
-    F_REMOVED=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM failure_resolutions;")
-    [[ "$F_REMOVED" == "0" ]] && F_REMOVED=1
-fi
+# fail_resolutions clears a fail veto, and a new fail_events row voids the
+# resolution before it, so either can change what is authorised with no review
+# row touched. Both are append-only: rows are compared whole, so any difference
+# is an addition or a removal. A table, or column set, that differs from the
+# base counts every row on both sides.
+append_only_diff() {  # table -> "added removed"
+    local t="$1" has has_base cols cols_base key
+    has=$(sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='$t';")
+    has_base=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='$t';")
+    cols=$(sqlite3 "$DB" "SELECT group_concat(name) FROM (SELECT name FROM pragma_table_info('$t') ORDER BY name);")
+    cols_base=$(sqlite3 "$BASE_DB" "SELECT group_concat(name) FROM (SELECT name FROM pragma_table_info('$t') ORDER BY name);")
+    if [[ "$has" == "1" && "$has_base" == "1" && "$cols" == "$cols_base" ]]; then
+        key=$(sqlite3 "$DB" "SELECT group_concat('b.'||name||' IS r.'||name, ' AND ') FROM pragma_table_info('$t');")
+        echo "$(count "SELECT COUNT(*) FROM $t r WHERE NOT EXISTS (SELECT 1 FROM b.$t b WHERE $key);") \
+$(count "SELECT COUNT(*) FROM b.$t b WHERE NOT EXISTS (SELECT 1 FROM $t r WHERE $key);")"
+        return
+    fi
+    local added=0 removed=0
+    [[ "$has" == "1" ]] && added=$(sqlite3 "$DB" "SELECT COUNT(*) FROM $t;")
+    if [[ "$has_base" == "1" ]]; then
+        removed=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM $t;")
+        [[ "$has" != "1" && "$removed" == "0" ]] && removed=1
+    fi
+    echo "$added $removed"
+}
+F_PAIR=$(append_only_diff fail_resolutions); F_ADDED=${F_PAIR% *}; F_REMOVED=${F_PAIR#* }
+E_PAIR=$(append_only_diff fail_events); E_ADDED=${E_PAIR% *}; E_REMOVED=${E_PAIR#* }
 echo "  failure resolutions added:   ${F_ADDED}"
 echo "  failure resolutions removed: ${F_REMOVED}"
+echo "  fail events added:           ${E_ADDED}"
+echo "  fail events removed:         ${E_REMOVED}"
 
 # repo_deps decides WHICH dependencies are checked and which are exempt.
 # source_kind='local' removes a row from both the denominator and the gate, and
@@ -259,6 +270,7 @@ if [[ "$ADDED" -eq 0 && "$REMOVED" -eq 0 && "$MODIFIED" -eq 0 \
    && "$A_ADDED" -eq 0 && "$A_REMOVED" -eq 0 && "$A_MODIFIED" -eq 0 \
    && "$I_ADDED" -eq 0 && "$I_REMOVED" -eq 0 && "$I_MODIFIED" -eq 0 \
    && "$F_ADDED" -eq 0 && "$F_REMOVED" -eq 0 \
+   && "$E_ADDED" -eq 0 && "$E_REMOVED" -eq 0 \
    && "$D_ADDED" -eq 0 && "$D_REMOVED" -eq 0 && "$D_MODIFIED" -eq 0 \
    && "$R_ADDED" -eq 0 && "$R_REMOVED" -eq 0 && "$R_MODIFIED" -eq 0 \
    && "$GUARD_NOW" == "$GUARD_BASE" ]]; then

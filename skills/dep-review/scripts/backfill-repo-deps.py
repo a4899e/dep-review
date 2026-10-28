@@ -796,7 +796,11 @@ def unbound_npm(lock_path: Path) -> set[tuple[str, str]]:
 
 
 def unbound_uv(lock_path: Path) -> set[tuple[str, str]]:
-    """Registry-sourced uv.lock entries with neither an sdist nor a wheel hash."""
+    """Registry-sourced uv.lock entries where any sdist or wheel lacks a hash.
+
+    One hashless archive is enough: uv can be told to pick it (e.g.
+    ``--no-binary-package``), so a hashed sibling does not bound the install.
+    """
     with lock_path.open("rb") as f:
         lock = tomllib.load(f)
     out: set[tuple[str, str]] = set()
@@ -804,10 +808,8 @@ def unbound_uv(lock_path: Path) -> set[tuple[str, str]]:
         src = pkg.get("source", {}) or {}
         if any(k in src for k in ("git", "editable", "virtual", "directory", "path")):
             continue
-        sdist = pkg.get("sdist")
-        hashed = (isinstance(sdist, dict) and sdist.get("hash")) or any(
-            isinstance(w, dict) and w.get("hash") for w in pkg.get("wheels", []) or []
-        )
+        archives = ([pkg["sdist"]] if "sdist" in pkg else []) + list(pkg.get("wheels") or [])
+        hashed = bool(archives) and all(isinstance(a, dict) and a.get("hash") for a in archives)
         if pkg.get("name") and pkg.get("version") and not hashed:
             out.add((pkg["name"].lower().replace("_", "-"), pkg["version"]))
     return out

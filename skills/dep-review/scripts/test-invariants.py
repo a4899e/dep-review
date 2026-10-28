@@ -646,9 +646,15 @@ def test_audit_detects() -> None:
         ("drop the artifact evidence table", "DROP TABLE review_artifacts"),
         (
             "add a failure resolution (clears a veto)",
-            "INSERT INTO failure_resolutions VALUES (1,'pypi','pkg','1.0','','x','t','y')",
+            "INSERT INTO fail_resolutions VALUES (1,'pypi','pkg','1.0','','x','t','y')",
         ),
         ("drop the admitted-artifact inventory", "DROP TABLE repo_dep_artifacts"),
+        (
+            "add a fail event (invalidates a resolution)",
+            "INSERT INTO fail_events (ecosystem,package,version,artifact_id,reviewed_at,reviewer)"
+            " VALUES ('pypi','pkg','1.0','','t','y')",
+        ),
+        ("drop the fail event log", "DROP TABLE fail_events"),
         (
             "append an inventory run (guard state flip)",
             (
@@ -1037,11 +1043,11 @@ def test_fail_verdicts_need_resolution() -> None:
         check("fail -> fail still allowed", blocked(
             "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','fail','more','2026-01-02 00:00:00','bob')"), False)
 
-        conn.execute("INSERT INTO failure_resolutions SELECT MAX(event_id),'pypi','p','1','','false positive: test fixture','2026-01-03 00:00:00','alice' FROM fail_events WHERE artifact_id=''")
+        conn.execute("INSERT INTO fail_resolutions SELECT MAX(event_id),'pypi','p','1','','false positive: test fixture','2026-01-03 00:00:00','alice' FROM fail_events WHERE artifact_id=''")
         conn.commit()
         check("resolved fail can be replaced", blocked(
             "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','pass','ok','2026-01-04 00:00:00','bob')"), False)
-        check("resolutions are append-only", blocked("DELETE FROM failure_resolutions"), True)
+        check("resolutions are append-only", blocked("DELETE FROM fail_resolutions"), True)
         conn.close()
 
 
@@ -1111,15 +1117,15 @@ def test_resolution_binds_to_one_fail() -> None:
     with tempfile.TemporaryDirectory() as d:
         db = Path(d) / "t.db"
         check("fail A recorded", _cli("record-review.py", db, stdin=rec("fail", "A")), 0)
-        check("A resolved", _cli("resolve-failure.py", db, "pypi", "p", "1", "--by", "alice",
-                                 stdin="A was a fixture"), 0)
+        check("A resolved", _cli("resolve-failure.py", db, "pypi", "p", "1", "--event", "1",
+                                 "--by", "alice", stdin="A was a fixture"), 0)
         check("fail B recorded", _cli("record-review.py", db, stdin=rec("fail", "B")), 0)
         check("pass over unresolved B refused",
               _cli("record-review.py", db, stdin=rec("pass", "ok")), 1)
     with tempfile.TemporaryDirectory() as d:
         db = Path(d) / "t.db"
         _cli("record-review.py", db, stdin=rec("fail", "A"))
-        _cli("resolve-failure.py", db, "pypi", "p", "1", "--by", "alice", stdin="fixture")
+        _cli("resolve-failure.py", db, "pypi", "p", "1", "--event", "1", "--by", "alice", stdin="fixture")
         check("same-second resolve then pass allowed",
               _cli("record-review.py", db, stdin=rec("pass", "ok")), 0)
 
@@ -1213,6 +1219,112 @@ def test_skill_doc_contract() -> None:
     check("cache check reads the reviewed commit", "sha256" in step2 and "source_ref" in step2, True)
 
 
+def _old_db(path: Path, schema: str) -> None:
+    conn = sqlite3.connect(path)
+    conn.executescript((SCRIPTS / "testdata" / schema).read_text())
+    conn.commit()
+    conn.close()
+
+
+def test_upgrade_existing_database() -> None:
+    """A database made by an earlier schema gets the event-bound veto, not the old one."""
+    section("schema upgrade")
+
+    def rec(verdict: str, notes: str) -> str:
+        return json.dumps({"ecosystem": "pypi", "package": "p", "version": "1", "sha256": "x",
+                           "verdict": verdict, "notes": notes, "reviewer": "test"})
+
+    for schema in ("schema-1cb3012.sql", "schema-e9b369c.sql"):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "t.db"
+            _old_db(db, schema)
+            check(f"{schema}: fail A", _cli("record-review.py", db, stdin=rec("fail", "A")), 0)
+            ev = sqlite3.connect(db).execute("SELECT MAX(event_id) FROM fail_events").fetchone()[0]
+            check(f"{schema}: resolve A", _cli("resolve-failure.py", db, "pypi", "p", "1",
+                                               "--event", str(ev), "--by", "alice", stdin="fixture"), 0)
+            check(f"{schema}: fail B", _cli("record-review.py", db, stdin=rec("fail", "B")), 0)
+            check(f"{schema}: pass over B refused", _cli("record-review.py", db, stdin=rec("pass", "ok")), 1)
+            ev = sqlite3.connect(db).execute("SELECT MAX(event_id) FROM fail_events").fetchone()[0]
+            _cli("resolve-failure.py", db, "pypi", "p", "1", "--event", str(ev), "--by", "alice", stdin="B too")
+            check(f"{schema}: pass after resolving B allowed (new guards active)",
+                  _cli("record-review.py", db, stdin=rec("pass", "ok")), 0)
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "t.db"
+            _old_db(db, schema)
+            conn = sqlite3.connect(db)
+            conn.execute("INSERT INTO reviews VALUES ('pypi','q','1','x','fail','m','2026-01-01 00:00:00','a')")
+            conn.commit()
+            conn.close()
+            check(f"{schema}: legacy fail still blocks a pass",
+                  _cli("record-review.py", db, stdin=rec("pass", "ok").replace('"p"', '"q"')), 1)
+
+    with tempfile.TemporaryDirectory() as d:
+        repo = git_fixture(Path(d))
+        _old_db(repo / "reviews.db", "schema-1cb3012.sql")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        subprocess.run(["git", "-C", str(repo), "commit", "-qam", "old"], check=True, env=env)
+        sqlite3.connect(repo / "reviews.db").executescript(SCHEMA_SRC.read_text())
+        rc, out = run_audit(repo)
+        check("audit over a pre-event baseline runs", (rc, "Error" in out), (0, False))
+
+
+def test_resolution_names_the_reviewed_event() -> None:
+    """A human's resolution of fail A never retargets to a fail B written meanwhile."""
+    section("resolution consent")
+
+    def rec(verdict: str, notes: str) -> str:
+        return json.dumps({"ecosystem": "pypi", "package": "p", "version": "1", "sha256": "x",
+                           "verdict": verdict, "notes": notes, "reviewer": "test"})
+
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _cli("record-review.py", db, stdin=rec("fail", "A"))
+        _cli("record-review.py", db, stdin=rec("fail", "B"))
+        check("resolving stale event 1 refused", _cli(
+            "resolve-failure.py", db, "pypi", "p", "1", "--event", "1", "--by", "alice",
+            stdin="only A was a false positive"), 1)
+        check("pass still refused", _cli("record-review.py", db, stdin=rec("pass", "ok")), 1)
+        check("no --event refused", _cli(
+            "resolve-failure.py", db, "pypi", "p", "1", "--by", "alice", stdin="x"), 2)
+        check("wrong key for event refused", _cli(
+            "resolve-failure.py", db, "pypi", "other", "1", "--event", "2", "--by", "alice", stdin="x"), 1)
+
+
+def test_uv_partially_hashed_release() -> None:
+    """One unhashed sdist or wheel makes the whole name@version unbound."""
+    section("uv partial hashes")
+    with tempfile.TemporaryDirectory() as d:
+        uv = Path(d) / "uv.lock"
+        head = ('version = 1\n[[package]]\nname = "dep"\nversion = "1.0"\n'
+                'source = { registry = "https://pypi.org/simple" }\n')
+        for name, body in (
+            ("hashless sdist + hashed wheel",
+             'sdist = { url = "https://x/dep-1.0.tar.gz" }\n'
+             'wheels = [{ url = "https://x/dep-1.0-py3-none-any.whl", hash = "sha256:w" }]\n'),
+            ("hashed sdist + hashless wheel",
+             'sdist = { url = "https://x/dep-1.0.tar.gz", hash = "sha256:s" }\n'
+             'wheels = [{ url = "https://x/dep-1.0-py3-none-any.whl" }]\n'),
+        ):
+            uv.write_text(head + body)
+            check(name, ("dep", "1.0") in bf.unbound_uv(uv), True)
+
+
+def test_source_read_must_be_boolean() -> None:
+    """A false-like non-boolean must not become evidence that bytes were read."""
+    section("source_read type")
+    for value in ("false", {"read": False}, 1, None):
+        with tempfile.TemporaryDirectory() as d:
+            payload = json.dumps({
+                "ecosystem": "pypi", "package": "pkg", "version": "1.0", "sha256": "x",
+                "verdict": "partial", "notes": "n", "reviewer": "test",
+                "artifacts": [{"artifact_id": "sha256:n", "artifact_name": "n.whl",
+                               "artifact_kind": "wheel", "source_read": value,
+                               "verdict": "pass", "notes": "n"}]})
+            check(f"source_read={value!r} rejected",
+                  _cli("record-review.py", Path(d) / "t.db", stdin=payload), 2)
+
+
 def main() -> None:
     test_npm_classification()
     test_uv_classification()
@@ -1241,6 +1353,10 @@ def main() -> None:
     test_unbound_copy_blocks_merge()
     test_unread_artifact_never_covers()
     test_skill_doc_contract()
+    test_upgrade_existing_database()
+    test_resolution_names_the_reviewed_event()
+    test_uv_partially_hashed_release()
+    test_source_read_must_be_boolean()
 
     print()
     if FAILURES:
