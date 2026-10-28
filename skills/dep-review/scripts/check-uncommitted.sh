@@ -194,10 +194,13 @@ $(count "SELECT COUNT(*) FROM b.$t b WHERE NOT EXISTS (SELECT 1 FROM $t r WHERE 
 }
 F_PAIR=$(append_only_diff fail_resolutions); F_ADDED=${F_PAIR% *}; F_REMOVED=${F_PAIR#* }
 E_PAIR=$(append_only_diff fail_events); E_ADDED=${E_PAIR% *}; E_REMOVED=${E_PAIR#* }
+V_PAIR=$(append_only_diff fail_event_evidence); V_ADDED=${V_PAIR% *}; V_REMOVED=${V_PAIR#* }
 echo "  failure resolutions added:   ${F_ADDED}"
 echo "  failure resolutions removed: ${F_REMOVED}"
 echo "  fail events added:           ${E_ADDED}"
 echo "  fail events removed:         ${E_REMOVED}"
+echo "  fail evidence added:         ${V_ADDED}"
+echo "  fail evidence removed:       ${V_REMOVED}"
 
 # repo_deps decides WHICH dependencies are checked and which are exempt.
 # source_kind='local' removes a row from both the denominator and the gate, and
@@ -271,6 +274,7 @@ if [[ "$ADDED" -eq 0 && "$REMOVED" -eq 0 && "$MODIFIED" -eq 0 \
    && "$I_ADDED" -eq 0 && "$I_REMOVED" -eq 0 && "$I_MODIFIED" -eq 0 \
    && "$F_ADDED" -eq 0 && "$F_REMOVED" -eq 0 \
    && "$E_ADDED" -eq 0 && "$E_REMOVED" -eq 0 \
+   && "$V_ADDED" -eq 0 && "$V_REMOVED" -eq 0 \
    && "$D_ADDED" -eq 0 && "$D_REMOVED" -eq 0 && "$D_MODIFIED" -eq 0 \
    && "$R_ADDED" -eq 0 && "$R_REMOVED" -eq 0 && "$R_MODIFIED" -eq 0 \
    && "$GUARD_NOW" == "$GUARD_BASE" ]]; then

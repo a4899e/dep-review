@@ -70,9 +70,10 @@ CREATE INDEX IF NOT EXISTS idx_reviews_verdict ON reviews(verdict);
 --
 -- Identity is an event id, not a timestamp. Every write of a fail appends a
 -- fail_events row (AUTOINCREMENT: ids never repeat), and a resolution names the
--- event it answers. Only a resolution of the LATEST event for a key clears it,
--- so resolving fail A cannot clear a fail B recorded afterwards, even in the
--- same second or from a teammate whose clock disagrees.
+-- event it answers. A key stays vetoed while ANY of its events is unresolved:
+-- resolving B neither clears an earlier independent finding A nor a later C,
+-- whatever the clocks say. fail_event_evidence keeps each event's notes, since
+-- a fail -> fail write replaces the notes on the reviews row.
 --
 -- UPGRADES. Everything below is applied to existing databases too, so it must
 -- converge from any earlier schema:
@@ -93,6 +94,11 @@ CREATE TABLE IF NOT EXISTS fail_events (
     reviewer    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fail_events_key ON fail_events(ecosystem, package, version, artifact_id);
+
+CREATE TABLE IF NOT EXISTS fail_event_evidence (
+    event_id INTEGER PRIMARY KEY REFERENCES fail_events(event_id),
+    notes    TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS fail_resolutions (
     fail_event_id INTEGER NOT NULL UNIQUE REFERENCES fail_events(event_id),
@@ -122,6 +128,12 @@ BEGIN SELECT RAISE(ABORT, 'fail_events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS fail_events_append_only_delete
 BEFORE DELETE ON fail_events
 BEGIN SELECT RAISE(ABORT, 'fail_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS fail_event_evidence_append_only_update
+BEFORE UPDATE ON fail_event_evidence
+BEGIN SELECT RAISE(ABORT, 'fail_event_evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS fail_event_evidence_append_only_delete
+BEFORE DELETE ON fail_event_evidence
+BEGIN SELECT RAISE(ABORT, 'fail_event_evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS fail_resolutions_append_only_update
 BEFORE UPDATE ON fail_resolutions
 BEGIN SELECT RAISE(ABORT, 'fail_resolutions is append-only'); END;
@@ -145,19 +157,23 @@ DROP TRIGGER IF EXISTS review_artifacts_keep_fail_delete;
 CREATE TRIGGER reviews_fail_event_insert
 AFTER INSERT ON reviews WHEN NEW.verdict='fail'
 BEGIN INSERT INTO fail_events (ecosystem, package, version, artifact_id, reviewed_at, reviewer)
-      VALUES (NEW.ecosystem, NEW.package, NEW.version, '', NEW.reviewed_at, NEW.reviewer); END;
+      VALUES (NEW.ecosystem, NEW.package, NEW.version, '', NEW.reviewed_at, NEW.reviewer);
+      INSERT INTO fail_event_evidence VALUES (last_insert_rowid(), NEW.notes); END;
 CREATE TRIGGER reviews_fail_event_update
 AFTER UPDATE ON reviews WHEN NEW.verdict='fail'
 BEGIN INSERT INTO fail_events (ecosystem, package, version, artifact_id, reviewed_at, reviewer)
-      VALUES (NEW.ecosystem, NEW.package, NEW.version, '', NEW.reviewed_at, NEW.reviewer); END;
+      VALUES (NEW.ecosystem, NEW.package, NEW.version, '', NEW.reviewed_at, NEW.reviewer);
+      INSERT INTO fail_event_evidence VALUES (last_insert_rowid(), NEW.notes); END;
 CREATE TRIGGER review_artifacts_fail_event_insert
 AFTER INSERT ON review_artifacts WHEN NEW.verdict='fail'
 BEGIN INSERT INTO fail_events (ecosystem, package, version, artifact_id, reviewed_at, reviewer)
-      VALUES (NEW.ecosystem, NEW.package, NEW.version, NEW.artifact_id, NEW.reviewed_at, NEW.reviewer); END;
+      VALUES (NEW.ecosystem, NEW.package, NEW.version, NEW.artifact_id, NEW.reviewed_at, NEW.reviewer);
+      INSERT INTO fail_event_evidence VALUES (last_insert_rowid(), NEW.notes); END;
 CREATE TRIGGER review_artifacts_fail_event_update
 AFTER UPDATE ON review_artifacts WHEN NEW.verdict='fail'
 BEGIN INSERT INTO fail_events (ecosystem, package, version, artifact_id, reviewed_at, reviewer)
-      VALUES (NEW.ecosystem, NEW.package, NEW.version, NEW.artifact_id, NEW.reviewed_at, NEW.reviewer); END;
+      VALUES (NEW.ecosystem, NEW.package, NEW.version, NEW.artifact_id, NEW.reviewed_at, NEW.reviewer);
+      INSERT INTO fail_event_evidence VALUES (last_insert_rowid(), NEW.notes); END;
 
 -- BEFORE INSERT also covers INSERT OR REPLACE: it fires while the old row
 -- still exists, before the conflict deletes it.
@@ -167,10 +183,10 @@ WHEN NEW.verdict <> 'fail' AND EXISTS (
     SELECT 1 FROM reviews r
      WHERE r.ecosystem=NEW.ecosystem AND r.package=NEW.package AND r.version=NEW.version
        AND r.verdict='fail'
-       AND NOT EXISTS (SELECT 1 FROM fail_resolutions f
-                  WHERE f.fail_event_id = (SELECT MAX(e.event_id) FROM fail_events e
-                     WHERE e.ecosystem=r.ecosystem AND e.package=r.package
-                       AND e.version=r.version AND e.artifact_id='')))
+       AND EXISTS (SELECT 1 FROM fail_events e
+                  WHERE e.ecosystem=r.ecosystem AND e.package=r.package
+                    AND e.version=r.version AND e.artifact_id=''
+                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER reviews_keep_fail_update
@@ -178,19 +194,19 @@ BEFORE UPDATE ON reviews
 WHEN OLD.verdict='fail'
  AND (NEW.verdict <> 'fail' OR NEW.ecosystem IS NOT OLD.ecosystem
       OR NEW.package IS NOT OLD.package OR NEW.version IS NOT OLD.version)
- AND NOT EXISTS (SELECT 1 FROM fail_resolutions f
-                  WHERE f.fail_event_id = (SELECT MAX(e.event_id) FROM fail_events e
-                     WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
-                       AND e.version=OLD.version AND e.artifact_id=''))
+ AND EXISTS (SELECT 1 FROM fail_events e
+                  WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
+                    AND e.version=OLD.version AND e.artifact_id=''
+                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER reviews_keep_fail_delete
 BEFORE DELETE ON reviews
 WHEN OLD.verdict='fail'
- AND NOT EXISTS (SELECT 1 FROM fail_resolutions f
-                  WHERE f.fail_event_id = (SELECT MAX(e.event_id) FROM fail_events e
-                     WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
-                       AND e.version=OLD.version AND e.artifact_id=''))
+ AND EXISTS (SELECT 1 FROM fail_events e
+                  WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
+                    AND e.version=OLD.version AND e.artifact_id=''
+                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER review_artifacts_keep_fail_insert
@@ -199,10 +215,10 @@ WHEN NEW.verdict <> 'fail' AND EXISTS (
     SELECT 1 FROM review_artifacts r
      WHERE r.ecosystem=NEW.ecosystem AND r.package=NEW.package AND r.version=NEW.version
        AND r.artifact_id=NEW.artifact_id AND r.verdict='fail'
-       AND NOT EXISTS (SELECT 1 FROM fail_resolutions f
-                  WHERE f.fail_event_id = (SELECT MAX(e.event_id) FROM fail_events e
-                     WHERE e.ecosystem=r.ecosystem AND e.package=r.package
-                       AND e.version=r.version AND e.artifact_id=r.artifact_id)))
+       AND EXISTS (SELECT 1 FROM fail_events e
+                  WHERE e.ecosystem=r.ecosystem AND e.package=r.package
+                    AND e.version=r.version AND e.artifact_id=r.artifact_id
+                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id)))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict on artifact: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER review_artifacts_keep_fail_update
@@ -210,18 +226,18 @@ BEFORE UPDATE ON review_artifacts
 WHEN OLD.verdict='fail'
  AND (NEW.verdict <> 'fail' OR NEW.ecosystem IS NOT OLD.ecosystem OR NEW.package IS NOT OLD.package
       OR NEW.version IS NOT OLD.version OR NEW.artifact_id IS NOT OLD.artifact_id)
- AND NOT EXISTS (SELECT 1 FROM fail_resolutions f
-                  WHERE f.fail_event_id = (SELECT MAX(e.event_id) FROM fail_events e
-                     WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
-                       AND e.version=OLD.version AND e.artifact_id=OLD.artifact_id))
+ AND EXISTS (SELECT 1 FROM fail_events e
+                  WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
+                    AND e.version=OLD.version AND e.artifact_id=OLD.artifact_id
+                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict on artifact: a human must resolve it with resolve-failure.py first'); END;
 
 CREATE TRIGGER review_artifacts_keep_fail_delete
 BEFORE DELETE ON review_artifacts
 WHEN OLD.verdict='fail'
- AND NOT EXISTS (SELECT 1 FROM fail_resolutions f
-                  WHERE f.fail_event_id = (SELECT MAX(e.event_id) FROM fail_events e
-                     WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
-                       AND e.version=OLD.version AND e.artifact_id=OLD.artifact_id))
+ AND EXISTS (SELECT 1 FROM fail_events e
+                  WHERE e.ecosystem=OLD.ecosystem AND e.package=OLD.package
+                    AND e.version=OLD.version AND e.artifact_id=OLD.artifact_id
+                    AND NOT EXISTS (SELECT 1 FROM fail_resolutions f WHERE f.fail_event_id=e.event_id))
 BEGIN SELECT RAISE(ABORT, 'unresolved fail verdict on artifact: a human must resolve it with resolve-failure.py first'); END;
 COMMIT;

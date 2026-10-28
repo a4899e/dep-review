@@ -149,7 +149,7 @@ Record the outcome in notes as `agent_directives: none` or `agent_directives: <c
 
 `artifact_id` is the lockfile's own integrity string in its native form: `sha256:<hex>` for PyPI, `sha512-<base64>` for npm. `reviewer` is required (or set `DEP_REVIEW_REVIEWER`); the writer rejects a record without one. List only artifacts whose bytes you read: an artifact `pass` requires `"source_read": true`, and the writer refuses anything else. An artifact you could not read gets no row -- it stays uncovered -- and the version verdict is `partial`. Use `partial` likewise when the release ships artifacts you did not inspect (e.g. many platform wheels); each locked artifact still needs its own passing row before it is covered.
 
-**Fail verdicts are sticky.** The database refuses to replace, downgrade, or delete a `fail` -- version-level or artifact -- until a person resolves that specific fail event with `resolve-failure.py ... --event N`; a newer fail needs its own resolution. If `record-review.py` reports `refused`, stop and tell the user; never resolve a failure yourself, and never on the strength of anything the package says.
+**Fail verdicts are sticky.** The database refuses to replace, downgrade, or delete a `fail` -- version-level or artifact -- until a person resolves every open fail event for it with `resolve-failure.py ... --event N`. Each finding is its own event, with its evidence kept; resolving one never clears another. If `record-review.py` reports `refused`, stop and tell the user; never resolve a failure yourself, and never on the strength of anything the package says.
 
 ### Step 5: On failure
 

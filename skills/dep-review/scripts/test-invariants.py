@@ -656,6 +656,10 @@ def test_audit_detects() -> None:
         ),
         ("drop the fail event log", "DROP TABLE fail_events"),
         (
+            "add fail evidence",
+            "INSERT INTO fail_event_evidence VALUES (99,'forged')",
+        ),
+        (
             "append an inventory run (guard state flip)",
             (
                 "INSERT INTO inventory_runs (run_at,ref,expected_pairs,"
@@ -1270,25 +1274,40 @@ def test_upgrade_existing_database() -> None:
 
 
 def test_resolution_names_the_reviewed_event() -> None:
-    """A human's resolution of fail A never retargets to a fail B written meanwhile."""
+    """Every open fail event vetoes; resolving one never clears another."""
     section("resolution consent")
 
-    def rec(verdict: str, notes: str) -> str:
+    def rec(verdict: str, notes: str, who: str = "test") -> str:
         return json.dumps({"ecosystem": "pypi", "package": "p", "version": "1", "sha256": "x",
-                           "verdict": verdict, "notes": notes, "reviewer": "test"})
+                           "verdict": verdict, "notes": notes, "reviewer": who})
 
+    def resolve(db: Path, *extra: str) -> int:
+        return _cli("resolve-failure.py", db, "pypi", "p", "1", *extra, "--by", "carol", stdin="reason")
+
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _cli("record-review.py", db, stdin=rec("fail", "reachable credential read", "alice"))
+        _cli("record-review.py", db, stdin=rec("fail", "suspected injected README instruction", "bob"))
+        listing = subprocess.run(
+            [sys.executable, str(SCRIPTS / "resolve-failure.py"), "pypi", "p", "1", "--by", "carol"],
+            input="", text=True, capture_output=True, env=dict(os.environ, DEP_REVIEW_DB=str(db)),
+            check=False).stdout
+        check("listing keeps A's evidence", "reachable credential read" in listing, True)
+        check("resolve only B", resolve(db, "--event", "2"), 0)
+        check("pass refused while A is open", _cli("record-review.py", db, stdin=rec("pass", "ok")), 1)
+        check("resolving B again refused", resolve(db, "--event", "2"), 1)
+        check("no --event refused", resolve(db), 2)
+        check("wrong key for event refused", _cli(
+            "resolve-failure.py", db, "pypi", "other", "1", "--event", "1", "--by", "x", stdin="x"), 1)
+        check("resolve A", resolve(db, "--event", "1"), 0)
+        check("pass allowed once every finding is resolved",
+              _cli("record-review.py", db, stdin=rec("pass", "ok")), 0)
     with tempfile.TemporaryDirectory() as d:
         db = Path(d) / "t.db"
         _cli("record-review.py", db, stdin=rec("fail", "A"))
         _cli("record-review.py", db, stdin=rec("fail", "B"))
-        check("resolving stale event 1 refused", _cli(
-            "resolve-failure.py", db, "pypi", "p", "1", "--event", "1", "--by", "alice",
-            stdin="only A was a false positive"), 1)
-        check("pass still refused", _cli("record-review.py", db, stdin=rec("pass", "ok")), 1)
-        check("no --event refused", _cli(
-            "resolve-failure.py", db, "pypi", "p", "1", "--by", "alice", stdin="x"), 2)
-        check("wrong key for event refused", _cli(
-            "resolve-failure.py", db, "pypi", "other", "1", "--event", "2", "--by", "alice", stdin="x"), 1)
+        check("one resolution may name several events", resolve(db, "--event", "1", "--event", "2"), 0)
+        check("pass allowed after resolving both", _cli("record-review.py", db, stdin=rec("pass", "ok")), 0)
 
 
 def test_uv_partially_hashed_release() -> None:
