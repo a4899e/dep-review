@@ -236,8 +236,7 @@ def npm_source_refs(lock_path: Path) -> dict[tuple[str, str], str]:
     """
     if not lock_path.exists():
         return {}
-    with lock_path.open() as handle:
-        lock = json.load(handle)
+    lock = _load_npm_lock(lock_path)
 
     refs: dict[tuple[str, str], str] = {}
     for path, info in lock.get("packages", {}).items():
@@ -273,8 +272,7 @@ def parse_npm(
     the inventory rather than reviewed-but-unattributed.
     """
     lockfile = lockfile if lockfile is not None else repo_dir / "package-lock.json"
-    with lockfile.open() as f:
-        lock = json.load(f)
+    lock = _load_npm_lock(lockfile)
 
     # Direct deps from root entry
     root = lock.get("packages", {}).get("", {})
@@ -409,39 +407,81 @@ def parse_requirements(repo_dir: Path, lockpath: Path) -> list[tuple[str, str, i
     :rtype: list[tuple[str, str, int, str | None]]
     """
     del repo_dir  # signature parity with parse_npm/parse_pnpm/parse_uv
-    text = lockpath.read_text(encoding="utf-8")
-
-    pin_re = re.compile(r"^([A-Za-z0-9._-]+)\s*==\s*([^\s;\\]+)")
-    rows: list[tuple[str, str, int, str | None]] = []
-    seen: set[tuple[str, str]] = set()
-    current: tuple[str, str] | None = None
-    direct_names: set[tuple[str, str]] = set()
-
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("#"):
-            # `# via -r <file>` means the package was named by the input file
-            # rather than pulled in by another package. A package can carry
-            # several `# via` lines; any one naming `-r` makes it direct.
-            if current is not None and "-r " in line:
-                direct_names.add(current)
-            continue
-        match = pin_re.match(line)
-        if not match:
-            continue
-        # PEP 503 normalisation, matching parse_uv, or the rows will not join.
-        norm = match.group(1).lower().replace("_", "-")
-        key = (norm, match.group(2))
-        current = key
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append(key)
-
     return [
-        (name, version, 1 if (name, version) in direct_names else 0, "main")
-        for name, version in rows
+        (name, version, 1 if direct else 0, "main")
+        for (name, version), (_, direct) in requirements_entries(
+            lockpath.read_text(encoding="utf-8")
+        ).items()
     ]
+
+
+# Global options that change where pip looks, not what it installs. Hashes
+# still pin the bytes, so they do not affect the inventory.
+_REQ_OPTIONS = {
+    "-i", "--index-url", "--extra-index-url", "--no-index", "-f", "--find-links",
+    "--require-hashes", "--pre", "--trusted-host", "--prefer-binary",
+    "--only-binary", "--no-binary",
+}
+_REQ_PIN = re.compile(
+    r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[A-Za-z0-9._,\s-]*\])?"
+    r"\s*==\s*([A-Za-z0-9._+!-]+)\s*(?:;.*)?$"
+)
+_REQ_HASH = re.compile(r"\s*--hash[=\s](\S+)")
+
+
+def requirements_entries(text: str) -> dict[tuple[str, str], tuple[list[str], bool]]:
+    """Parse a hash-locked requirements file into {(name, version): (hashes, direct)}.
+
+    Fails closed. Every install-bearing line must be an exact ``==`` pin; an
+    include (``-r``/``-c``), editable, direct reference, URL, path, range, or
+    unknown option raises ``ValueError`` rather than being skipped -- a line
+    this function cannot represent is a dependency the inventory would
+    otherwise silently lose. Extras (``pkg[extra]==1.0``) and environment
+    markers are accepted; the pinned distribution is the same.
+    """
+    # Join backslash continuations into logical lines, as pip does.
+    logical: list[str] = []
+    buf = ""
+    for raw in text.splitlines():
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1] + " "
+            continue
+        logical.append(buf + raw)
+        buf = ""
+    if buf:
+        logical.append(buf)
+
+    out: dict[tuple[str, str], tuple[list[str], bool]] = {}
+    current: tuple[str, str] | None = None
+    for raw in logical:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            # `# via -r <file>` means the input file named the package directly.
+            if current is not None and "-r " in line:
+                out[current] = (out[current][0], True)
+            continue
+        line = re.sub(r"\s+#.*$", "", line)
+        if line.startswith("-"):
+            option = re.split(r"[\s=]", line, maxsplit=1)[0]
+            if option not in _REQ_OPTIONS:
+                raise ValueError(f"unsupported requirements line: {line[:120]!r}")
+            continue
+        hashes = _REQ_HASH.findall(line)
+        spec = _REQ_HASH.sub("", line).strip()
+        match = _REQ_PIN.match(spec)
+        if not match or "*" in match.group(2) or " --" in f" {spec}":
+            raise ValueError(f"not an exact == pin this parser can represent: {spec[:120]!r}")
+        for digest in hashes:
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise ValueError(f"{spec}: unsupported hash {digest[:20]!r} (need sha256)")
+        # PEP 503 normalisation, matching parse_uv, or the rows will not join.
+        key = (match.group(1).lower().replace("_", "-"), match.group(2))
+        prev = out.get(key, ([], False))
+        out[key] = (prev[0] + [h for h in hashes if h not in prev[0]], prev[1])
+        current = key
+    return out
 
 
 def artifacts_requirements(
@@ -465,20 +505,10 @@ def artifacts_requirements(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))["artifacts"]
 
     out: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
-    current: tuple[str, str] | None = None
-    hash_re = re.compile(r"--hash=(sha256:[0-9a-f]{64})")
-
-    for raw in lock_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if line.startswith("#"):
-            continue
-        match = re.match(r"^([A-Za-z0-9._-]+)\s*==\s*([^\s;\\]+)", line)
-        if match:
-            current = (match.group(1).lower().replace("_", "-"), match.group(2))
-            out.setdefault(current, [])
-        if current is None:
-            continue
-        for digest in hash_re.findall(line):
+    entries = requirements_entries(lock_path.read_text(encoding="utf-8"))
+    for current, (hashes, _) in entries.items():
+        out.setdefault(current, [])
+        for digest in hashes:
             entry = manifest.get(digest)
             if entry is None:
                 raise KeyError(
@@ -641,15 +671,18 @@ def artifacts_uv(lock_path: Path) -> dict[tuple[str, str], list[tuple[str, str, 
         # correct rather than missing data -- but it must not then read as
         # covered, which is why the coverage query treats an empty artifact set
         # as unverified.
-        if found:
-            out[key] = found
+        # Union, not assignment: a universal lock can hold one name/version from
+        # several indexes (marker-dependent), each admitting different bytes.
+        bucket = out.setdefault(key, []) if found else None
+        for entry in found:
+            if entry not in bucket:
+                bucket.append(entry)
     return out
 
 
 def artifacts_npm(lock_path: Path) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
     """Map (package, version) -> [(integrity, filename, kind)] from package-lock.json."""
-    with lock_path.open() as f:
-        lock = json.load(f)
+    lock = _load_npm_lock(lock_path)
 
     out: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
     for path, info in lock.get("packages", {}).items():
@@ -751,7 +784,7 @@ def source_kinds_uv(lock_path: Path) -> dict[tuple[str, str], str]:
             kind = "local"
         else:
             kind = "registry"
-        out[(name.lower().replace("_", "-"), version)] = kind
+        _merge_kind(out, (name.lower().replace("_", "-"), version), kind)
     return out
 
 
@@ -763,8 +796,7 @@ def source_kinds_npm(lock_path: Path) -> dict[tuple[str, str], str]:
     entry whose `integrity` failed to extract -- that is the case that used to
     masquerade as local and escape the gate entirely.
     """
-    with lock_path.open() as f:
-        lock = json.load(f)
+    lock = _load_npm_lock(lock_path)
 
     out: dict[tuple[str, str], str] = {}
     for path, info in lock.get("packages", {}).items():
@@ -790,7 +822,7 @@ def source_kinds_npm(lock_path: Path) -> dict[tuple[str, str], str]:
             kind = "local"
         else:
             kind = "registry"
-        out[(name, version)] = kind
+        _merge_kind(out, (name, version), kind)
     return out
 
 
@@ -807,8 +839,117 @@ def source_kinds_pnpm(lock_path: Path) -> dict[tuple[str, str], str]:
     return kinds
 
 
+def _load_npm_lock(lock_path: Path) -> dict:
+    """Load a package-lock.json, refusing schemas this script cannot read.
+
+    lockfileVersion 1 keeps its graph under ``dependencies``, not ``packages``.
+    Reading it as if it had no ``packages`` would inventory zero dependencies and
+    record the run complete -- a covered repo with nothing in it.
+    """
+    with lock_path.open() as f:
+        lock = json.load(f)
+    if not isinstance(lock.get("packages"), dict):
+        raise ValueError(
+            f"{lock_path.name}: lockfileVersion {lock.get('lockfileVersion')!r} has no "
+            "'packages' map; regenerate it with npm >= 7 (lockfileVersion 2 or 3)"
+        )
+    return lock
+
+
+def _merge_kind(out: dict[tuple[str, str], str], key: tuple[str, str], kind: str) -> None:
+    """Record *kind* for *key*, failing closed when one name@version has several.
+
+    A lock can hold the same name@version from more than one source. Keeping
+    the last one let a nested ``file:`` copy turn a registry dependency 'local',
+    which exempts it from the gate. Local yields to anything remote; registry
+    and git cannot both be right, so that combination is refused.
+    """
+    prev = out.get(key)
+    if prev is None or prev == kind:
+        out[key] = kind
+    elif "local" in (prev, kind):
+        out[key] = prev if kind == "local" else kind
+    else:
+        raise ValueError(f"{key[0]} {key[1]}: locked from both {prev} and {kind} sources")
+
+
 def _basename(url: str) -> str:
     return url.rsplit("/", 1)[-1] if url else ""
+
+
+def _read_lock(
+    repo: str, lockname: str, tmp: Path
+) -> tuple[list, dict, dict, dict]:
+    """Parse one materialised lock into (rows, source_refs, artifacts, kinds)."""
+    # Dispatch on the basename, not the whole relative path: a nested lock such
+    # as infra/cdk/package-lock.json must still route to the npm parser rather
+    # than falling through to parse_uv.
+    kind = Path(lockname).name
+    lock = tmp / lockname
+    if kind == "package-lock.json":
+        return parse_npm(tmp, lock), npm_source_refs(lock), artifacts_npm(lock), source_kinds_npm(lock)
+    if kind == "pnpm-lock.yaml":
+        # pnpm records a git dependency's commit in the package key rather than
+        # a resolved URL; not extracted yet, so such a dependency stays
+        # uncovered rather than wrongly covered.
+        return parse_pnpm(tmp), {}, artifacts_pnpm(lock), source_kinds_pnpm(lock)
+    if kind.endswith(".txt"):
+        manifest = MANIFESTS.get((repo, lockname))
+        if manifest is None:
+            raise KeyError(
+                f"{repo}/{lockname} has no manifest in repos.json; a "
+                "pip lock cannot name its artifacts without one"
+            )
+        rows = parse_requirements(tmp, lock)
+        return (
+            rows,
+            {},
+            artifacts_requirements(lock, Path(manifest)),
+            {(r[0], r[1]): "registry" for r in rows},
+        )
+    if kind == "uv.lock":
+        return parse_uv(tmp), git_source_refs(lock), artifacts_uv(lock), source_kinds_uv(lock)
+    raise ValueError(f"unsupported lockfile {lockname}")
+
+
+def _read_group(
+    repo: str, repo_dir: Path, snapshot_ref: str, locknames: list[str]
+) -> tuple[list, dict, dict, dict]:
+    """Read every lock of one (repo, ecosystem) at *snapshot_ref* and union them.
+
+    Conflicting identities across locks -- the same name@version pinned to two
+    commits, or to registry and git -- raise rather than letting one lock win.
+    """
+    rows: dict[tuple[str, str], tuple[int, str | None]] = {}
+    refs: dict[tuple[str, str], str] = {}
+    artifacts: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    kinds: dict[tuple[str, str], str] = {}
+    for lockname in locknames:
+        tmp = Path(tempfile.mkdtemp(prefix="repo-deps-"))
+        try:
+            # pyproject.toml is only fetched beside a ROOT uv.lock; a nested one
+            # would need its own sibling.
+            wanted = [lockname] + (["pyproject.toml"] if lockname == "uv.lock" else [])
+            if not materialise(repo_dir, snapshot_ref, wanted, tmp):
+                raise FileNotFoundError(f"no {lockname} at {snapshot_ref[:8]}")
+            # Must happen here: the finally below removes tmp.
+            l_rows, l_refs, l_arts, l_kinds = _read_lock(repo, lockname, tmp)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        for n, v, d, t in l_rows:
+            prev = rows.get((n, v))
+            if prev is None or (d and not prev[0]):
+                rows[(n, v)] = (d, t)
+        for key, commit in l_refs.items():
+            if key in refs and refs[key] != commit:
+                raise AmbiguousSourceRef(f"{key[0]} {key[1]}: two commits locked")
+            refs[key] = commit
+        for key, items in l_arts.items():
+            bucket = artifacts.setdefault(key, [])
+            bucket.extend(i for i in items if i not in bucket)
+        for key, kind in l_kinds.items():
+            _merge_kind(kinds, key, kind)
+    return [(n, v, d, t) for (n, v), (d, t) in rows.items()], refs, artifacts, kinds
 
 
 def backfill(
@@ -830,9 +971,18 @@ def backfill(
     expected = 0
     completed = 0
 
+    # Group every registered lock by (repo, ecosystem). A repo can register a
+    # root lock and a nested one for the same ecosystem; replacing the pair's
+    # rows once per lock let each later lock erase the earlier one while the run
+    # still recorded complete. All locks in a group are read and unioned first,
+    # and a failure in any of them skips the whole group.
+    groups: dict[tuple[str, str], list[str]] = {}
     for repo, ecosystem, lockname in LOCKFILES:
         if only_repos and repo not in only_repos:
             continue
+        groups.setdefault((repo, ecosystem), []).append(lockname)
+
+    for (repo, ecosystem), locknames in groups.items():
         expected += 1
         repo_dir = repo_dir_for(repo)
 
@@ -840,10 +990,7 @@ def backfill(
         # inventoried from the working tree -- that fallback is what produced a
         # coverage number for revisions nobody deployed.
         if not repo_dir.is_dir():
-            print(
-                f"  SKIP {repo} ({ecosystem}): no checkout at {repo_dir}",
-                file=sys.stderr,
-            )
+            print(f"  SKIP {repo} ({ecosystem}): no checkout at {repo_dir}", file=sys.stderr)
             skipped += 1
             skipped_pairs.append(f"{repo}/{ecosystem}")
             continue
@@ -854,69 +1001,15 @@ def backfill(
             skipped_pairs.append(f"{repo}/{ecosystem}")
             continue
 
-        tmp = Path(tempfile.mkdtemp(prefix="repo-deps-"))
         try:
-            # Dispatch on the basename, not the whole relative path: a nested
-            # lock such as infra/cdk/package-lock.json must still route to the
-            # npm parser rather than falling through to parse_uv.
-            kind = Path(lockname).name
-            # pyproject.toml is only fetched for a ROOT uv.lock; a nested one
-            # would need its sibling, which no repo has today.
-            wanted = [lockname] + (["pyproject.toml"] if lockname == "uv.lock" else [])
-            if not materialise(repo_dir, snapshot_ref, wanted, tmp):
-                print(
-                    f"  SKIP {repo} ({ecosystem}): no {lockname} at {snapshot_ref[:8]}",
-                    file=sys.stderr,
-                )
-                skipped += 1
-                skipped_pairs.append(f"{repo}/{ecosystem}")
-                continue
-
-            try:
-                if kind == "package-lock.json":
-                    rows = parse_npm(tmp, tmp / lockname)
-                elif kind == "pnpm-lock.yaml":
-                    rows = parse_pnpm(tmp)
-                elif kind.endswith(".txt"):
-                    rows = parse_requirements(tmp, tmp / lockname)
-                else:
-                    rows = parse_uv(tmp)
-                if kind == "uv.lock":
-                    source_refs = git_source_refs(tmp / lockname)
-                elif kind == "package-lock.json":
-                    source_refs = npm_source_refs(tmp / lockname)
-                else:
-                    # pnpm records a git dependency's commit in the package key
-                    # rather than a resolved URL; not extracted yet, so such a
-                    # dependency stays uncovered rather than wrongly covered.
-                    source_refs = {}
-                # Must happen here: the finally below removes tmp before the
-                # database writes.
-                if kind == "package-lock.json":
-                    artifacts = artifacts_npm(tmp / lockname)
-                    kinds = source_kinds_npm(tmp / lockname)
-                elif kind == "pnpm-lock.yaml":
-                    artifacts = artifacts_pnpm(tmp / lockname)
-                    kinds = source_kinds_pnpm(tmp / lockname)
-                elif kind.endswith(".txt"):
-                    manifest_rel = MANIFESTS.get((repo, lockname))
-                    if manifest_rel is None:
-                        raise KeyError(
-                            f"{repo}/{lockname} has no manifest in repos.json; a "
-                            "pip lock cannot name its artifacts without one"
-                        )
-                    artifacts = artifacts_requirements(tmp / lockname, Path(manifest_rel))
-                    kinds = {k: "registry" for k in {(r[0], r[1]) for r in rows}}
-                else:
-                    artifacts = artifacts_uv(tmp / lockname)
-                    kinds = source_kinds_uv(tmp / lockname)
-            except Exception as e:  # noqa: BLE001 -- one bad repo must not abort the sweep
-                print(f"  ERROR {repo} ({ecosystem}): {e}", file=sys.stderr)
-                skipped += 1
-                skipped_pairs.append(f"{repo}/{ecosystem}")
-                continue
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            rows, source_refs, artifacts, kinds = _read_group(
+                repo, repo_dir, snapshot_ref, locknames
+            )
+        except Exception as e:  # noqa: BLE001 -- one bad repo must not abort the sweep
+            print(f"  ERROR {repo} ({ecosystem}): {e}", file=sys.stderr)
+            skipped += 1
+            skipped_pairs.append(f"{repo}/{ecosystem}")
+            continue
 
         # Replace existing rows for this (repo, ecosystem)
         cur.execute(

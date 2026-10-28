@@ -643,6 +643,12 @@ def test_audit_detects() -> None:
             "forge a review verdict",
             "UPDATE reviews SET verdict='fail'",
         ),
+        ("drop the artifact evidence table", "DROP TABLE review_artifacts"),
+        (
+            "add a failure resolution (clears a veto)",
+            "INSERT INTO failure_resolutions VALUES ('pypi','pkg','1.0','','x','t','y')",
+        ),
+        ("drop the admitted-artifact inventory", "DROP TABLE repo_dep_artifacts"),
         (
             "append an inventory run (guard state flip)",
             (
@@ -842,6 +848,251 @@ def test_requirements_manifest_fails_closed() -> None:
               equivalent(lock_name, manifest_name), "rejected")
 
 
+# ---------------------------------------------------------------------------
+# PR #1 review findings. Each reproduces a reported false-success shape.
+# ---------------------------------------------------------------------------
+
+
+def _git_repo(repo: Path) -> None:
+    env = dict(
+        os.environ,
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@t",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@t",
+    )
+    for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "x"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True, env=env, capture_output=True)
+
+
+def _npm_pkg(version: str, integrity: str, resolved: str | None = None) -> dict:
+    return {
+        "version": version,
+        "integrity": integrity,
+        "resolved": resolved or f"https://registry.npmjs.org/x/-/x-{version}.tgz",
+    }
+
+
+def test_multiple_locks_same_repo_ecosystem() -> None:
+    """Two registered locks for one (repo, ecosystem) must union, not overwrite."""
+    section("multiple lockfiles per repo/ecosystem")
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        repo = root / "fakerepo"
+        (repo / "tools").mkdir(parents=True)
+        (repo / "package-lock.json").write_text(json.dumps({
+            "lockfileVersion": 3,
+            "packages": {"": {"dependencies": {"app-dep": "1.0.0"}},
+                         "node_modules/app-dep": _npm_pkg("1.0.0", "sha512-APP")}}))
+        (repo / "tools" / "package-lock.json").write_text(json.dumps({
+            "lockfileVersion": 3,
+            "packages": {"": {"dependencies": {"tool-dep": "2.0.0"}},
+                         "node_modules/tool-dep": _npm_pkg("2.0.0", "sha512-TOOL")}}))
+        _git_repo(repo)
+        db = root / "t.db"
+        build_db(db).close()
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM inventory_runs")
+        orig = bf.REPO_ROOT, bf.LOCKFILES, bf.REPO_PATHS
+        try:
+            bf.REPO_ROOT, bf.REPO_PATHS = root, {}
+            bf.LOCKFILES = [
+                ("fakerepo", "npm", "package-lock.json"),
+                ("fakerepo", "npm", "tools/package-lock.json"),
+            ]
+            bf.backfill(conn, "HEAD")
+        finally:
+            bf.REPO_ROOT, bf.LOCKFILES, bf.REPO_PATHS = orig
+        pkgs = sorted(r[0] for r in conn.execute("SELECT package FROM repo_deps"))
+        arts = sorted(r[0] for r in conn.execute("SELECT artifact_id FROM repo_dep_artifacts"))
+        run = conn.execute("SELECT expected_pairs, status FROM inventory_runs").fetchone()
+        conn.close()
+        check("both locks' deps inventoried", pkgs, ["app-dep", "tool-dep"])
+        check("both locks' artifacts inventoried", arts, ["sha512-APP", "sha512-TOOL"])
+        check("one repo/ecosystem pair, complete", run, (1, "complete"))
+
+
+def test_mixed_source_kinds_fail_closed() -> None:
+    """A name@version seen as registry AND local must not collapse to local."""
+    section("mixed source kinds")
+    with tempfile.TemporaryDirectory() as d:
+        lock = Path(d) / "package-lock.json"
+        lock.write_text(json.dumps({"lockfileVersion": 3, "packages": {
+            "": {},
+            "node_modules/dep": _npm_pkg("1.0.0", "sha512-R"),
+            "node_modules/x/node_modules/dep": _npm_pkg("1.0.0", "sha512-L", "file:dep-1.0.0.tgz"),
+        }}))
+        check("npm registry+local -> registry",
+              bf.source_kinds_npm(lock).get(("dep", "1.0.0")), "registry")
+        lock.write_text(json.dumps({"lockfileVersion": 3, "packages": {
+            "": {},
+            "node_modules/x/node_modules/dep": _npm_pkg("1.0.0", "sha512-L", "file:dep-1.0.0.tgz"),
+            "node_modules/dep": _npm_pkg("1.0.0", "sha512-R"),
+        }}))
+        check("npm local+registry (either order) -> registry",
+              bf.source_kinds_npm(lock).get(("dep", "1.0.0")), "registry")
+
+        uv = Path(d) / "uv.lock"
+        uv.write_text(
+            'version = 1\n'
+            '[[package]]\nname = "dep"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+            '[[package]]\nname = "dep"\nversion = "1.0"\nsource = { directory = "vendor/dep" }\n'
+        )
+        check("uv registry+local -> registry",
+              bf.source_kinds_uv(uv).get(("dep", "1.0")), "registry")
+        uv.write_text(
+            'version = 1\n'
+            '[[package]]\nname = "dep"\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+            '[[package]]\nname = "dep"\nversion = "1.0"\nsource = { git = "https://g/x?rev=a#' + "a" * 40 + '" }\n'
+        )
+        try:
+            bf.source_kinds_uv(uv)
+            raised = False
+        except ValueError:
+            raised = True
+        check("uv registry+git raises", raised, True)
+
+
+def test_uv_artifact_union() -> None:
+    """Same name/version from two indexes: every admitted artifact is kept."""
+    section("uv artifact union")
+    with tempfile.TemporaryDirectory() as d:
+        uv = Path(d) / "uv.lock"
+        uv.write_text(
+            'version = 1\n'
+            '[[package]]\nname = "dep"\nversion = "1.0"\nsource = { registry = "https://a/simple" }\n'
+            'sdist = { url = "https://a/dep-1.0.tar.gz", hash = "sha256:aaa" }\n'
+            '[[package]]\nname = "dep"\nversion = "1.0"\nsource = { registry = "https://b/simple" }\n'
+            'sdist = { url = "https://b/dep-1.0.tar.gz", hash = "sha256:bbb" }\n'
+        )
+        ids = sorted(a[0] for a in bf.artifacts_uv(uv).get(("dep", "1.0"), []))
+        check("both sdist hashes admitted", ids, ["sha256:aaa", "sha256:bbb"])
+
+
+def test_npm_v1_lock_rejected() -> None:
+    """lockfileVersion 1 has no `packages`; it must not read as an empty graph."""
+    section("npm lockfileVersion 1")
+    with tempfile.TemporaryDirectory() as d:
+        lock = Path(d) / "package-lock.json"
+        lock.write_text(json.dumps({"lockfileVersion": 1, "dependencies": {
+            "dep": {"version": "1.0.0", "integrity": "sha512-X"}}}))
+        for fn in (lambda: bf.parse_npm(Path(d), lock), lambda: bf.artifacts_npm(lock),
+                   lambda: bf.source_kinds_npm(lock), lambda: bf.npm_source_refs(lock)):
+            try:
+                fn()
+                raised = False
+            except ValueError:
+                raised = True
+            check("v1 lock raises", raised, True)
+
+
+def test_requirements_unrepresentable_lines() -> None:
+    """Extras parse; includes, ranges and direct references fail closed."""
+    section("requirements parsing")
+    h = "sha256:" + "a" * 64
+    with tempfile.TemporaryDirectory() as d:
+        req = Path(d) / "r.txt"
+        req.write_text(f"Example_Pkg[extra,other]==1.0.0 \\\n    --hash={h}\n    # via -r in.txt\n")
+        check("extras pin parsed",
+              [(n, v) for n, v, _, _ in bf.parse_requirements(Path(d), req)],
+              [("example-pkg", "1.0.0")])
+        for bad in ("-r other.txt", "--requirement other.txt", "-c c.txt", "-e .",
+                    "foo>=1.0", "foo", "foo @ https://x/foo.whl", "https://x/foo.whl",
+                    "./local/pkg"):
+            req.write_text(bad + "\n")
+            try:
+                bf.parse_requirements(Path(d), req)
+                raised = False
+            except ValueError:
+                raised = True
+            check(f"rejects {bad!r}", raised, True)
+
+
+def test_fail_verdicts_need_resolution() -> None:
+    """A fail cannot be overwritten or deleted without a failure_resolutions row."""
+    section("fail verdict retention")
+    with tempfile.TemporaryDirectory() as d:
+        conn = build_db(Path(d) / "t.db")
+        conn.execute("DELETE FROM inventory_runs")
+        conn.execute("INSERT INTO reviews VALUES ('pypi','p','1','x','fail','malware','2026-01-01 00:00:00','alice')")
+        conn.execute("INSERT INTO review_artifacts VALUES ('pypi','p','1','sha256:s','p.tar.gz','sdist',1,'fail','bad','2026-01-01 00:00:00','alice')")
+        conn.commit()
+
+        def blocked(sql: str) -> bool:
+            try:
+                conn.execute(sql)
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                return True
+            conn.rollback()
+            return False
+
+        check("REPLACE fail with partial blocked", blocked(
+            "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','partial','ok','2026-01-02 00:00:00','bob')"), True)
+        check("UPDATE fail to pass blocked", blocked("UPDATE reviews SET verdict='pass'"), True)
+        check("DELETE fail blocked", blocked("DELETE FROM reviews"), True)
+        check("REPLACE artifact fail blocked", blocked(
+            "INSERT OR REPLACE INTO review_artifacts VALUES ('pypi','p','1','sha256:s','p.tar.gz','sdist',1,'pass','ok','2026-01-02 00:00:00','bob')"), True)
+        check("DELETE artifact fail blocked", blocked("DELETE FROM review_artifacts"), True)
+        check("fail -> fail still allowed", blocked(
+            "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','fail','more','2026-01-02 00:00:00','bob')"), False)
+
+        conn.execute("INSERT INTO failure_resolutions VALUES ('pypi','p','1','','false positive: test fixture','2026-01-03 00:00:00','alice')")
+        conn.commit()
+        check("resolved fail can be replaced", blocked(
+            "INSERT OR REPLACE INTO reviews VALUES ('pypi','p','1','x','pass','ok','2026-01-04 00:00:00','bob')"), False)
+        check("resolutions are append-only", blocked("DELETE FROM failure_resolutions"), True)
+        conn.close()
+
+
+def test_artifact_fail_vetoes_release() -> None:
+    """A failing artifact anywhere in a release vetoes every artifact of it."""
+    section("artifact fail veto")
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        conn = build_db(db)
+        add_dep(conn, "pkg", "1.0", "registry")
+        add_review(conn, "pkg", "1.0", "partial")
+        add_artifact(conn, "pkg", "1.0", "sha256:wheel", True)
+        conn.execute(
+            "INSERT INTO review_artifacts VALUES ('pypi','pkg','1.0','sha256:sdist','p.tar.gz','sdist',1,'fail','malware','t','alice')")
+        conn.commit()
+        conn.close()
+        check("clean wheel not covered when sibling sdist failed", covered_count(db), 0)
+
+
+def test_record_review_is_inert() -> None:
+    """Package-derived notes are stored verbatim and never reach a shell."""
+    section("record-review.py")
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        marker = Path(d) / "marker"
+        notes = f"evidence: $(touch {marker}) `touch {marker}` it's ; DROP TABLE reviews; --"
+        payload = json.dumps({
+            "ecosystem": "npm", "package": "evil", "version": "1.0.0", "sha256": "sha512-E",
+            "verdict": "fail", "notes": notes, "reviewer": "test",
+            "artifacts": [{"artifact_id": "sha512-E", "artifact_name": "evil-1.0.0.tgz",
+                           "artifact_kind": "tarball", "source_read": True,
+                           "verdict": "fail", "notes": notes}],
+        })
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "record-review.py")], input=payload, text=True,
+            capture_output=True, env=dict(os.environ, DEP_REVIEW_DB=str(db)), check=False)
+        check("record-review exit", proc.returncode, 0)
+        conn = sqlite3.connect(db)
+        stored = conn.execute("SELECT notes FROM reviews").fetchone()
+        astored = conn.execute("SELECT notes FROM review_artifacts").fetchone()
+        conn.close()
+        check("notes stored verbatim", stored, (notes,))
+        check("artifact notes stored verbatim", astored, (notes,))
+        check("no substitution executed", marker.exists(), False)
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "record-review.py")],
+            input=payload.replace('"fail"', '"pass"'), text=True,
+            capture_output=True, env=dict(os.environ, DEP_REVIEW_DB=str(db)), check=False)
+        check("cannot pass over an unresolved fail", proc.returncode != 0, True)
+
+
 def main() -> None:
     test_npm_classification()
     test_uv_classification()
@@ -857,6 +1108,14 @@ def main() -> None:
     test_guards()
     test_audit_detects()
     test_requirements_manifest_fails_closed()
+    test_multiple_locks_same_repo_ecosystem()
+    test_mixed_source_kinds_fail_closed()
+    test_uv_artifact_union()
+    test_npm_v1_lock_rejected()
+    test_requirements_unrepresentable_lines()
+    test_fail_verdicts_need_resolution()
+    test_artifact_fail_vetoes_release()
+    test_record_review_is_inert()
 
     print()
     if FAILURES:

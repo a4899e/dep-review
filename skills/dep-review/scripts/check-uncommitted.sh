@@ -128,6 +128,11 @@ if [[ "$HAS_A" == "1" && "$HAS_A_BASE" == "1" ]]; then
          OR r.reviewer      IS NOT b.reviewer;")
 elif [[ "$HAS_A" == "1" && "$HAS_A_BASE" == "0" ]]; then
     A_ADDED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM review_artifacts;")
+# The inverse: the table is gone from the working copy. Every base row is
+# lost evidence, not "no change".
+elif [[ "$HAS_A" == "0" && "$HAS_A_BASE" == "1" ]]; then
+    A_REMOVED=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM review_artifacts;")
+    [[ "$A_REMOVED" == "0" ]] && A_REMOVED=1  # dropping the table is itself a removal
 fi
 
 echo "  artifact rows added:    ${A_ADDED}"
@@ -153,11 +158,35 @@ if [[ "$HAS_I" == "1" && "$HAS_I_BASE" == "1" ]]; then
          OR r.artifact_kind IS NOT b.artifact_kind;")
 elif [[ "$HAS_I" == "1" && "$HAS_I_BASE" == "0" ]]; then
     I_ADDED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM repo_dep_artifacts;")
+elif [[ "$HAS_I" == "0" && "$HAS_I_BASE" == "1" ]]; then
+    I_REMOVED=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM repo_dep_artifacts;")
+    [[ "$I_REMOVED" == "0" ]] && I_REMOVED=1
 fi
 
 echo "  inventory rows added:    ${I_ADDED}"
 echo "  inventory rows removed:  ${I_REMOVED}"
 echo "  inventory rows modified: ${I_MODIFIED}"
+
+# failure_resolutions clears a fail veto, so a new row here can authorise a
+# package with no review row touched. Rows are compared whole: the table is
+# append-only, so any difference is an addition or a removal.
+FKEY="b.ecosystem IS r.ecosystem AND b.package IS r.package AND b.version IS r.version AND b.artifact_id IS r.artifact_id AND b.resolution IS r.resolution AND b.resolved_at IS r.resolved_at AND b.resolved_by IS r.resolved_by"
+HAS_F=$(sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='failure_resolutions';")
+HAS_F_BASE=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='failure_resolutions';")
+F_ADDED=0; F_REMOVED=0
+if [[ "$HAS_F" == "1" && "$HAS_F_BASE" == "1" ]]; then
+    F_ADDED=$(count "SELECT COUNT(*) FROM failure_resolutions r
+      WHERE NOT EXISTS (SELECT 1 FROM b.failure_resolutions b WHERE ${FKEY});")
+    F_REMOVED=$(count "SELECT COUNT(*) FROM b.failure_resolutions b
+      WHERE NOT EXISTS (SELECT 1 FROM failure_resolutions r WHERE ${FKEY});")
+elif [[ "$HAS_F" == "1" ]]; then
+    F_ADDED=$(sqlite3 "$DB" "SELECT COUNT(*) FROM failure_resolutions;")
+elif [[ "$HAS_F_BASE" == "1" ]]; then
+    F_REMOVED=$(sqlite3 "$BASE_DB" "SELECT COUNT(*) FROM failure_resolutions;")
+    [[ "$F_REMOVED" == "0" ]] && F_REMOVED=1
+fi
+echo "  failure resolutions added:   ${F_ADDED}"
+echo "  failure resolutions removed: ${F_REMOVED}"
 
 # repo_deps decides WHICH dependencies are checked and which are exempt.
 # source_kind='local' removes a row from both the denominator and the gate, and
@@ -229,6 +258,7 @@ echo "  dependency rows modified: ${D_MODIFIED}"
 if [[ "$ADDED" -eq 0 && "$REMOVED" -eq 0 && "$MODIFIED" -eq 0 \
    && "$A_ADDED" -eq 0 && "$A_REMOVED" -eq 0 && "$A_MODIFIED" -eq 0 \
    && "$I_ADDED" -eq 0 && "$I_REMOVED" -eq 0 && "$I_MODIFIED" -eq 0 \
+   && "$F_ADDED" -eq 0 && "$F_REMOVED" -eq 0 \
    && "$D_ADDED" -eq 0 && "$D_REMOVED" -eq 0 && "$D_MODIFIED" -eq 0 \
    && "$R_ADDED" -eq 0 && "$R_REMOVED" -eq 0 && "$R_MODIFIED" -eq 0 \
    && "$GUARD_NOW" == "$GUARD_BASE" ]]; then

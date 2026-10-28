@@ -27,14 +27,13 @@ Then register it in repos.json as that lockfile's "manifest".
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
 import urllib.request
 from pathlib import Path
 
-PIN_RE = re.compile(r"^([A-Za-z0-9._-]+)\s*==\s*([^\s;\\]+)")
-HASH_RE = re.compile(r"--hash=(sha256:[0-9a-f]{64})")
 
 # PyPI's packagetype -> repo_dep_artifacts.artifact_kind. Anything else is an
 # error rather than a guess: a kind this script has not seen before must be
@@ -59,22 +58,19 @@ def parse_lock(path: Path) -> dict[tuple[str, str], list[str]]:
     :returns: Hashes grouped by the pin they belong to, in file order.
     :rtype: dict[tuple[str, str], list[str]]
     """
-    out: dict[tuple[str, str], list[str]] = {}
-    current: tuple[str, str] | None = None
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if line.startswith("#"):
-            continue
-        match = PIN_RE.match(line)
-        if match:
-            # PEP 503 normalisation, matching backfill-repo-deps.py, or the
-            # rows will not join: every run of -, _ or . collapses to one
-            # hyphen, then lowercase.
-            current = (pep503(match.group(1)), match.group(2))
-            out.setdefault(current, [])
-        if current is not None:
-            out[current].extend(HASH_RE.findall(line))
-    return out
+    # The same fail-closed parser the inventory uses, so a line one of them
+    # cannot represent is rejected by both rather than dropped by either.
+    spec = importlib.util.spec_from_file_location(
+        "backfill", Path(__file__).resolve().parent / "backfill-repo-deps.py"
+    )
+    bf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bf)
+    return {
+        (pep503(name), version): hashes
+        for (name, version), (hashes, _) in bf.requirements_entries(
+            path.read_text(encoding="utf-8")
+        ).items()
+    }
 
 
 def registry_files(package: str, version: str) -> dict[str, tuple[str, str]]:

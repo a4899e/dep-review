@@ -47,6 +47,8 @@ The schema (`skills/dep-review/scripts/schema.sql`) is applied idempotently, so 
 
 To share reviews with a team, keep the database in a git repo and point `DEP_REVIEW_DB` at it; `check-uncommitted.sh` reports which rows a working copy adds, removes or changes, since a binary diff shows none of that. A shared database is only as trustworthy as everyone who can write to it. Treat a `pass` from a reviewer you do not know as a claim, and re-review.
 
+Verdicts are written by `record-review.py` from a JSON file, never through a shell, because review notes quote attacker-written text. A `fail` is sticky: the database itself refuses to replace, downgrade or delete it until a person records a resolution with `resolve-failure.py`, and a failing artifact vetoes its whole release.
+
 Coverage is artifact-level: a version `pass` authorises a locked dependency only when every artifact the lockfile admits (each wheel, sdist, or tarball hash) also has a passing artifact review. See `query-coverage.sh` for the rules.
 
 ## Limits

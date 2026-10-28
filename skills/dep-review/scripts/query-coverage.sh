@@ -85,6 +85,12 @@ COVERED_SQL="
       WHEN EXISTS (SELECT 1 FROM reviews r
                     WHERE r.ecosystem=d.ecosystem AND r.package=d.package
                       AND r.version=d.version AND r.verdict='fail') THEN 0
+      -- A failing artifact vetoes its whole release, not just itself. A
+      -- malicious sdist says the release (or its maintainer) is compromised;
+      -- a clean-looking wheel beside it must not stay authorised.
+      WHEN EXISTS (SELECT 1 FROM review_artifacts a
+                    WHERE a.ecosystem=d.ecosystem AND a.package=d.package
+                      AND a.version=d.version AND a.verdict='fail') THEN 0
       WHEN d.source_kind='local' THEN 0
       WHEN d.source_kind='git' THEN
         EXISTS (SELECT 1 FROM reviews r

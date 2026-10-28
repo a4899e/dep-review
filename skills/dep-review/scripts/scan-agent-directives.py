@@ -18,7 +18,7 @@ and non-printables escaped, and they are package content -- data, not
 instructions.
 
 Usage: scan-agent-directives.py DIR [--max-per-category N]
-Exit:  0 no hits, 1 hits found, 2 usage error
+Exit:  0 no hits, 1 hits found, 2 usage error, 3 no hits but some files unreadable
 """
 
 from __future__ import annotations
@@ -174,16 +174,32 @@ FOREIGN_SCRIPTS = {
     "Kana": "\u3040-\u30ff",
     "Hangul": "\uac00-\ud7af",
 }
-FOREIGN_RUNS = {
-    name: re.compile(f"[{rng}][{rng}\\s,.!?'\"，。！？、]{{2,}}[{rng}]")
-    for name, rng in FOREIGN_SCRIPTS.items()
-}
-# A word mixing Latin with Cyrillic or Greek letters: a homoglyph, used to slip
-# a keyword ("ignоre", Cyrillic о) past exact-match filters.
-MIXED_WORD = re.compile(r"\w*(?:[a-zA-Z][\u0400-\u04ff\u0370-\u03ff]|[\u0400-\u04ff\u0370-\u03ff][a-zA-Z])\w*")
+# Three consecutive letters of one script. No variable-width context, so the
+# match is linear in the line length.
+FOREIGN_RUNS = {name: re.compile(f"[{rng}]{{3,}}") for name, rng in FOREIGN_SCRIPTS.items()}
+# A word mixing Latin with Cyrillic or Greek letters is a homoglyph, used to slip
+# a keyword ("ignоre", Cyrillic о) past exact-match filters. Checked per token:
+# an unanchored \w* pattern backtracks quadratically on long ASCII runs.
+WORD = re.compile(r"\w+")
+LATIN = re.compile(r"[a-zA-Z]")
+CYR_GREEK = re.compile(r"[\u0400-\u04ff\u0370-\u03ff]")
 
-SKIP_DIRS = {".git", "node_modules"}
-MAX_BYTES = 5_000_000
+# Bundled node_modules are scanned too: they ship in the tarball and execute.
+SKIP_DIRS = {".git"}
+# Lines are scanned in windows so one multi-megabyte minified line stays cheap;
+# the overlap keeps a phrase that straddles a boundary from being missed.
+WINDOW = 65_536
+OVERLAP = 512
+# Past this, an agent cannot read the file whole -- and padding a payload out to
+# this size is a known way to push it past a model's context.
+LARGE_BYTES = 1_000_000
+TEXT_SUFFIXES = {
+    ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".json", ".py", ".pyi",
+    ".pth", ".md", ".rst", ".txt", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".sh", ".bash",
+    ".ps1", ".bat", ".cmd", ".html", ".htm", ".css", ".xml", ".svg", ".map", ".gyp", ".c",
+    ".cc", ".cpp", ".h", ".hpp", ".rs", ".go", ".rb", ".pl", ".lua", ".java", ".kt", "",
+}
+ASCII_RUN = re.compile(rb"[\x20-\x7e\t]{6,}")
 
 
 def clip(text: str, n: int = 200) -> str:
@@ -200,56 +216,93 @@ def decode_tags(run: str) -> str:
     return "".join(chr(ord(c) - 0xE0000) for c in run if 0xE0020 <= ord(c) <= 0xE007E)
 
 
+def _windows(line: str):
+    if len(line) <= WINDOW:
+        yield 0, line
+        return
+    for off in range(0, len(line), WINDOW - OVERLAP):
+        yield off, line[off : off + WINDOW]
+
+
+def scan_lines(lines, rel: str, hits: dict[str, list[str]], unicode_checks: bool = True) -> None:
+    # Summarised per file and script, not per line: a locale table would
+    # otherwise bury every other category.
+    foreign: dict[str, list[str]] = defaultdict(list)
+    foreign_sample: dict[str, str] = {}
+    for loc, line in lines:
+        seen: set[str] = set()
+        for _, chunk in _windows(line):
+            for cat, pats in PATTERNS.items():
+                if cat in seen:
+                    continue
+                for pat in pats:
+                    m = pat.search(chunk)
+                    if m:
+                        start = max(0, m.start() - 60)
+                        hits[cat].append(f"{rel}:{loc}\t{clip(chunk[start:])}")
+                        seen.add(cat)
+                        break
+            if not unicode_checks:
+                continue
+            for name, pat in FOREIGN_RUNS.items():
+                m = pat.search(chunk)
+                if m and name not in seen:
+                    seen.add(name)
+                    foreign[name].append(loc)
+                    foreign_sample.setdefault(name, clip(chunk[max(0, m.start() - 40):]))
+            if "mixed-script" not in seen:
+                for w in WORD.finditer(chunk):
+                    tok = w.group(0)
+                    if LATIN.search(tok) and CYR_GREEK.search(tok):
+                        hits["mixed-script"].append(f"{rel}:{loc}\t{clip(tok, 80)} in: {clip(chunk)}")
+                        seen.add("mixed-script")
+                        break
+            inv = INVISIBLE.findall(chunk)
+            # A lone BOM at the very start of a file is normal.
+            if inv and not (loc == 1 and inv == ["\ufeff"] and chunk.startswith("\ufeff")):
+                if "hidden-unicode" not in seen:
+                    names = sorted({unicodedata.name(c, f"U+{ord(c):04X}") for c in inv})
+                    hidden = "".join(decode_tags(r) for r in TAGS.findall(chunk))
+                    detail = f"{len(inv)} invisible char(s): {', '.join(names)[:160]}"
+                    if hidden:
+                        detail += f" | decoded tag text: {clip(hidden)}"
+                    hits["hidden-unicode"].append(f"{rel}:{loc}\t{detail}")
+                    seen.add("hidden-unicode")
+            if VARIATION_RUN.search(chunk) and "variation" not in seen:
+                hits["hidden-unicode"].append(
+                    f"{rel}:{loc}\trun of variation selectors (can encode a hidden payload)"
+                )
+                seen.add("variation")
+    for name, locs in foreign.items():
+        hits["foreign-prose"].append(
+            f"{rel}:{locs[0]}\t{name} text on {len(locs)} line(s), first: {foreign_sample[name]}"
+        )
+
+
 def scan_file(path: Path, rel: str, hits: dict[str, list[str]]) -> None:
+    """Scan one file. Nothing is skipped silently: what cannot be read is reported."""
     if path.name.lower() in AGENT_FILES:
         hits["agent-config-file"].append(f"{rel}:1\tpackage ships an agent instruction/config file")
     try:
-        if path.stat().st_size > MAX_BYTES:
-            return
         raw = path.read_bytes()
-    except OSError:
+    except OSError as e:
+        hits["scan-incomplete"].append(f"{rel}:0\tnot scanned: {e.strerror or e}")
         return
-    if b"\0" in raw[:8192]:
-        return  # binary; native code is reviewed separately
-    text = raw.decode("utf-8", errors="replace")
-    # Summarised per file and script, not per line: a locale table would
-    # otherwise bury every other category.
-    foreign: dict[str, list[int]] = defaultdict(list)
-    foreign_sample: dict[str, str] = {}
-    for lineno, line in enumerate(text.splitlines(), 1):
-        for name, pat in FOREIGN_RUNS.items():
-            m = pat.search(line)
-            if m:
-                foreign[name].append(lineno)
-                foreign_sample.setdefault(name, clip(line[max(0, m.start() - 40):]))
-        mixed = MIXED_WORD.search(line)
-        if mixed:
-            hits["mixed-script"].append(f"{rel}:{lineno}\t{clip(mixed.group(0), 80)} in: {clip(line)}")
-        for cat, pats in PATTERNS.items():
-            for pat in pats:
-                m = pat.search(line)
-                if m:
-                    start = max(0, m.start() - 60)
-                    hits[cat].append(f"{rel}:{lineno}\t{clip(line[start:])}")
-                    break
-        inv = INVISIBLE.findall(line)
-        if inv:
-            names = sorted({unicodedata.name(c, f"U+{ord(c):04X}") for c in inv})
-            # A lone BOM at the very start of a file is normal.
-            if not (lineno == 1 and inv == ["﻿"] and line.startswith("﻿")):
-                hidden = "".join(decode_tags(r) for r in TAGS.findall(line))
-                detail = f"{len(inv)} invisible char(s): {', '.join(names)[:160]}"
-                if hidden:
-                    detail += f" | decoded tag text: {clip(hidden)}"
-                hits["hidden-unicode"].append(f"{rel}:{lineno}\t{detail}")
-        if VARIATION_RUN.search(line):
-            hits["hidden-unicode"].append(
-                f"{rel}:{lineno}\trun of variation selectors (can encode a hidden payload)"
-            )
-    for name, lines in foreign.items():
-        hits["foreign-prose"].append(
-            f"{rel}:{lines[0]}\t{name} text on {len(lines)} line(s), first: {foreign_sample[name]}"
+    if len(raw) > LARGE_BYTES:
+        hits["large-file"].append(
+            f"{rel}:0\t{len(raw) / 1e6:.1f} MB; do not read it whole -- search it and "
+            "review what entry points reach"
         )
+    if b"\0" in raw and path.suffix.lower() not in TEXT_SUFFIXES:
+        # Binary: scan its printable strings for directives. Native code itself
+        # is reviewed separately; this only stops text hiding in a blob.
+        strings = (
+            (f"@{m.start()}", m.group(0).decode("ascii")) for m in ASCII_RUN.finditer(raw)
+        )
+        scan_lines(strings, rel, hits, unicode_checks=False)
+        return
+    text = raw.decode("utf-8", errors="replace").replace("\0", "\n")
+    scan_lines(enumerate(text.splitlines(), 1), rel, hits)
 
 
 def main() -> int:
@@ -270,6 +323,11 @@ def main() -> int:
     if not hits:
         print("no agent-directed text found")
         return 0
+    if set(hits) == {"scan-incomplete"}:
+        for row in hits["scan-incomplete"]:
+            print(f"scan-incomplete\t{row}")
+        print("no hits, but the scan is INCOMPLETE; the files above were not read")
+        return 3
     for cat in sorted(hits):
         rows = hits[cat]
         for row in rows[: args.max_per_category]:
