@@ -708,6 +708,37 @@ def test_audit_sees_sqlite_like_names() -> None:
         rc, out = run_audit(repo)
         check("dropping a trigger named sqliteX... is reported", (rc, "sqliteXpolicy" in out), (1, True))
 
+def _hidden_char(c: str) -> bool:
+    o = ord(c)
+    return (0x200B <= o <= 0x200F or 0x2028 <= o <= 0x202E or 0x2060 <= o <= 0x206F
+            or o in (0xFEFF, 0x00AD, 0x061C) or 0xFE00 <= o <= 0xFE0F
+            or 0xE0000 <= o <= 0xE007F or 0xE0100 <= o <= 0xE01EF)
+
+
+def test_no_hidden_characters_in_source() -> None:
+    """No tracked file carries literal invisible or bidi-control characters.
+
+    A literal bidi override makes a line display differently from its bytes
+    (Trojan Source), so a reviewer cannot trust what they read. Code that needs
+    these characters writes them as escapes (\\u202e), which compile the same.
+    """
+    section("hidden characters in source")
+    root = SCRIPTS.parents[2]
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__")]
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                text = path.read_bytes().decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            for i, line in enumerate(text.split("\n"), 1):
+                found = sorted({f"U+{ord(c):04X}" for c in line if _hidden_char(c)})
+                if found:
+                    hits.append(f"{path.relative_to(root)}:{i} {' '.join(found)}")
+    check("no literal invisible or bidi characters in tracked files", hits, [])
+
 def test_ambiguous_lock_fails_closed() -> None:
     """The reviewer's reproduction: an ambiguous lock must not yield coverage.
 
@@ -1636,6 +1667,7 @@ def main() -> None:
     test_guards()
     test_audit_detects()
     test_audit_sees_sqlite_like_names()
+    test_no_hidden_characters_in_source()
     test_requirements_manifest_fails_closed()
     test_multiple_locks_same_repo_ecosystem()
     test_mixed_source_kinds_fail_closed()

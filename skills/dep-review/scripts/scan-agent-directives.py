@@ -155,11 +155,11 @@ AGENT_FILES = {
 # Invisible characters that hide text from a human while a model still reads
 # it. U+E0000-E007F (tag characters) map 1:1 onto ASCII: "ASCII smuggling".
 INVISIBLE = re.compile(
-    "[​-‏ -‮⁠-⁤⁦-⁩⁪-⁯﻿"
+    "[\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\u206a-\u206f\ufeff"
     "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
 )
 TAGS = re.compile("[\U000e0000-\U000e007f]+")
-VARIATION_RUN = re.compile("[︀-️\U000e0100-\U000e01ef]{4,}")
+VARIATION_RUN = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]{4,}")
 
 # Letters from non-Latin scripts. A model reads these as fluently as English,
 # while a reviewer skimming English code may not, and no regex list covers

@@ -167,7 +167,7 @@ def main() -> int:
             failures.append(f"false positive {cat}: {text!r}")
     if "agent-config-file" not in scan("# rules", "AGENTS.md"):
         failures.append("missed agent-config-file: AGENTS.md")
-    if scan("﻿import os"):
+    if scan("\ufeffimport os"):
         failures.append("false positive on a leading BOM")
 
     failures += coverage_cases()
