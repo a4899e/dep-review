@@ -1,6 +1,6 @@
 {
   "name": "dep-review",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Review PyPI and npm dependency source for supply chain attacks and prompt injection aimed at AI agents, with a reusable SQLite review database.",
   "license": "MIT",
   "keywords": [
