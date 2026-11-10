@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS repo_deps (
     PRIMARY KEY (repo, ecosystem, package, version)
 );
 CREATE TABLE IF NOT EXISTS review_artifacts (
-    ecosystem     TEXT NOT NULL CHECK (ecosystem IN ('npm','pypi','maven','golang')),
+    ecosystem     TEXT NOT NULL CHECK (ecosystem IN ('npm','pypi','maven','golang','cargo')),
     package       TEXT NOT NULL,
     version       TEXT NOT NULL,
     artifact_id   TEXT NOT NULL,
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS review_artifacts (
     PRIMARY KEY (ecosystem, package, version, artifact_id)
 );
 CREATE TABLE IF NOT EXISTS reviews (
-    ecosystem   TEXT NOT NULL CHECK (ecosystem IN ('npm','pypi','maven','golang')),
+    ecosystem   TEXT NOT NULL CHECK (ecosystem IN ('npm','pypi','maven','golang','cargo')),
     package     TEXT NOT NULL,
     version     TEXT NOT NULL,
     sha256      TEXT NOT NULL,

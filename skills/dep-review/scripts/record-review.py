@@ -14,7 +14,7 @@ Write the JSON with your file-writing tool, not with echo/printf, then:
 Input::
 
     {
-      "ecosystem": "npm" | "pypi",
+      "ecosystem": "npm" | "pypi" | "cargo",
       "package": "left-pad", "version": "1.3.0",
       "sha256": "<lockfile integrity, or git commit for git sources>",
       "verdict": "pass" | "fail" | "partial",
@@ -45,7 +45,7 @@ import sys
 from pathlib import Path
 
 SCHEMA = Path(__file__).resolve().parent / "schema.sql"
-ECOSYSTEMS = {"npm", "pypi"}
+ECOSYSTEMS = {"npm", "pypi", "cargo"}
 VERDICTS = {"pass", "fail", "partial"}
 ARTIFACT_VERDICTS = {"pass", "fail"}
 KINDS = {"sdist", "wheel", "tarball", "binary"}
@@ -57,6 +57,12 @@ def db_path() -> Path:
         return Path(explicit)
     xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(os.environ.get("DEP_REVIEW_HOME") or Path(xdg) / "dep-review") / "reviews.db"
+
+
+def table_sql(conn: sqlite3.Connection, table: str) -> str:
+    """CREATE statement of a table; CREATE TABLE IF NOT EXISTS never updates an existing one."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row[0] if row else ""
 
 
 def need(obj: dict, key: str, allowed: set[str] | None = None) -> str:
@@ -115,6 +121,12 @@ def main() -> int:
     conn = sqlite3.connect(path)
     try:
         conn.executescript(SCHEMA.read_text())
+        missing = [t for t in ("reviews", "review_artifacts") if f"'{eco}'" not in table_sql(conn, t)]
+        if missing:
+            print(f"refused: this database predates ecosystem {eco!r} ({', '.join(missing)});"
+                  f" run {Path(__file__).resolve().parent / 'migrate-ecosystems.py'} {path} first",
+                  file=sys.stderr)
+            return 1
         with conn:
             conn.execute(
                 "INSERT OR REPLACE INTO reviews (ecosystem, package, version, sha256, verdict,"

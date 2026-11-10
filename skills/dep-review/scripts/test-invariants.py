@@ -655,6 +655,8 @@ def test_audit_detects() -> None:
             " VALUES ('pypi','pkg','1.0','','t','y')",
         ),
         ("drop the fail event log", "DROP TABLE fail_events"),
+        ("drop a fail-veto guard trigger", "DROP TRIGGER reviews_keep_fail_insert"),
+        ("drop an index", "DROP INDEX idx_reviews_verdict"),
         (
             "add fail evidence",
             "INSERT INTO fail_event_evidence VALUES (99,'forged')",
@@ -683,6 +685,28 @@ def test_audit_detects() -> None:
             check(name, rc, 1)
             (repo / "reviews.db").write_bytes(backup)
 
+
+def test_audit_sees_sqlite_like_names() -> None:
+    """Only SQLite's own sqlite_ objects are skipped; '_' is not a wildcard."""
+    section("schema audit: object names")
+    with tempfile.TemporaryDirectory() as d:
+        repo = git_fixture(Path(d))
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        conn = sqlite3.connect(repo / "reviews.db")
+        conn.execute("CREATE TRIGGER sqliteXpolicy BEFORE INSERT ON reviews"
+                     " WHEN NEW.reviewer='untrusted' BEGIN SELECT RAISE(ABORT, 'no'); END")
+        conn.commit()
+        conn.close()
+        subprocess.run(["git", "-C", str(repo), "commit", "-qam", "policy"], check=True, env=env,
+                       capture_output=True)
+        check("baseline with sqliteX trigger is clean", run_audit(repo)[0], 0)
+        conn = sqlite3.connect(repo / "reviews.db")
+        conn.execute("DROP TRIGGER sqliteXpolicy")
+        conn.commit()
+        conn.close()
+        rc, out = run_audit(repo)
+        check("dropping a trigger named sqliteX... is reported", (rc, "sqliteXpolicy" in out), (1, True))
 
 def test_ambiguous_lock_fails_closed() -> None:
     """The reviewer's reproduction: an ambiguous lock must not yield coverage.
@@ -1277,6 +1301,225 @@ def test_upgrade_existing_database() -> None:
         check("audit over a pre-event baseline runs", (rc, "Error" in out), (0, False))
 
 
+def _db_state(db: Path) -> dict:
+    """Every row a migration must carry over, plus the schema objects it must restore."""
+    conn = sqlite3.connect(db)
+    try:
+        state = {t: sorted(conn.execute(f"SELECT * FROM {t}").fetchall())
+                 for t in ("reviews", "review_artifacts", "fail_events",
+                           "fail_event_evidence", "fail_resolutions")}
+        state["triggers"] = sorted(r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'"))
+        state["indexes"] = sorted(r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"))
+    finally:
+        conn.close()
+    return state
+
+
+def _migrate(db: Path) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(SCRIPTS / "migrate-ecosystems.py"), str(db)],
+                          text=True, capture_output=True, check=False)
+
+
+def test_cargo_ecosystem() -> None:
+    """Rust crates are recorded as ecosystem 'cargo'; existing databases migrate losslessly."""
+    section("cargo ecosystem")
+
+    def rec(eco: str, pkg: str, verdict: str, artifacts: bool = False) -> str:
+        r = {"ecosystem": eco, "package": pkg, "version": "1.0.0", "sha256": "ab" * 32,
+             "verdict": verdict, "notes": "n", "reviewer": "test"}
+        if artifacts:
+            r["artifacts"] = [{"artifact_id": "ab" * 32, "artifact_name": f"{pkg}-1.0.0.crate",
+                               "artifact_kind": "tarball", "source_read": True,
+                               "verdict": verdict, "notes": "n"}]
+        return json.dumps(r)
+
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "fresh.db"
+        check("fresh db accepts a cargo review",
+              _cli("record-review.py", db, stdin=rec("cargo", "c", "pass", artifacts=True)), 0)
+        fresh = _db_state(db)
+
+    for schema in ("schema-76f81b1.sql", "schema-b337c6c.sql", "schema-1cb3012.sql", "schema-e9b369c.sql"):
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "t.db"
+            _old_db(db, schema)
+            check(f"{schema}: pypi fail", _cli("record-review.py", db, stdin=rec("pypi", "p", "fail")), 0)
+            check(f"{schema}: npm pass with artifact",
+                  _cli("record-review.py", db, stdin=rec("npm", "n", "pass", artifacts=True)), 0)
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPTS / "record-review.py")], input=rec("cargo", "c", "pass"),
+                text=True, capture_output=True, env=dict(os.environ, DEP_REVIEW_DB=str(db)), check=False)
+            check(f"{schema}: unmigrated db refuses cargo", proc.returncode, 1)
+            check(f"{schema}: refusal names the migration", "migrate-ecosystems.py" in proc.stderr, True)
+            before = _db_state(db)
+            check(f"{schema}: migrate exits 0", _migrate(db).returncode, 0)
+            check(f"{schema}: no free pages left behind (git-tracked file stays small)",
+                  sqlite3.connect(db).execute("PRAGMA freelist_count").fetchone()[0], 0)
+            after = _db_state(db)
+            for t in ("reviews", "review_artifacts", "fail_events", "fail_event_evidence", "fail_resolutions"):
+                check(f"{schema}: {t} rows unchanged", after[t], before[t])
+            for k in ("triggers", "indexes"):
+                check(f"{schema}: {k} all kept", after[k], before[k])
+                check(f"{schema}: {k} include every fresh-db one", set(fresh[k]) <= set(after[k]), True)
+            check(f"{schema}: pass over the open pypi fail still refused",
+                  _cli("record-review.py", db, stdin=rec("pypi", "p", "pass")), 1)
+            check(f"{schema}: cargo accepted after migration",
+                  _cli("record-review.py", db, stdin=rec("cargo", "c", "pass", artifacts=True)), 0)
+            check(f"{schema}: cargo fail creates an event",
+                  _cli("record-review.py", db, stdin=rec("cargo", "c2", "fail")), 0)
+            check(f"{schema}: pass over the cargo fail refused",
+                  _cli("record-review.py", db, stdin=rec("cargo", "c2", "pass")), 1)
+            settled = _db_state(db)
+            second = _migrate(db)
+            check(f"{schema}: second migrate is a no-op", (second.returncode, _db_state(db)), (0, settled))
+
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "missing.db"
+        check("migrate refuses a missing database", _migrate(db).returncode != 0, True)
+        check("migrate did not create it", db.exists(), False)
+
+    # Objects schema.sql does not define would vanish with DROP TABLE: refuse instead.
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _old_db(db, "schema-76f81b1.sql")
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE INDEX team_local_idx ON reviews(reviewer)")
+        conn.commit()
+        conn.close()
+        before = _db_state(db)
+        proc = _migrate(db)
+        check("migrate refuses a table with objects schema.sql lacks", proc.returncode, 1)
+        check("refusal names the object", "team_local_idx" in proc.stderr, True)
+        check("refused migration changed nothing", _db_state(db), before)
+        check("refused migration left the old CHECK",
+              "'cargo'" in sqlite3.connect(db).execute(
+                  "SELECT sql FROM sqlite_master WHERE name='reviews'").fetchone()[0], False)
+
+    # An index schema.sql names but with a changed definition would be replaced: refuse.
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _old_db(db, "schema-76f81b1.sql")
+        conn = sqlite3.connect(db)
+        conn.execute("DROP INDEX idx_reviews_package")
+        conn.execute("CREATE UNIQUE INDEX idx_reviews_package ON reviews(ecosystem, package, sha256)")
+        conn.commit()
+        conn.close()
+        before = _db_state(db)
+        proc = _migrate(db)
+        check("migrate refuses an index whose definition differs from schema.sql", proc.returncode, 1)
+        check("that refusal names the index", "idx_reviews_package" in proc.stderr, True)
+        check("refused (changed index) migration changed nothing", _db_state(db), before)
+
+    # The write lock is held from the first look at the schema: no other connection
+    # can add an object between the check and the rebuild.
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _old_db(db, "schema-76f81b1.sql")
+        spec = importlib.util.spec_from_file_location("mig2", SCRIPTS / "migrate-ecosystems.py")
+        mig2 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mig2)
+        raced = []
+        real_table_sql = mig2.rr.table_sql
+
+        def racing_table_sql(conn, table):
+            if not raced:
+                other = sqlite3.connect(db, timeout=0)
+                try:
+                    other.execute("CREATE INDEX late_idx ON reviews(notes)")
+                    other.commit()
+                    raced.append("committed")
+                except sqlite3.OperationalError as e:
+                    raced.append(f"blocked: {e}")
+                finally:
+                    other.close()
+            return real_table_sql(conn, table)
+
+        mig2.rr.table_sql = racing_table_sql
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            rc = mig2.main(["migrate-ecosystems.py", str(db)])
+        check("a concurrent schema write during inspection is blocked",
+              raced[:1] and raced[0].startswith("blocked"), True)
+        check("migration still succeeds after blocking it", rc, 0)
+
+    # Views hold no data; a view over a rebuilt table must survive the rebuild.
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _old_db(db, "schema-76f81b1.sql")
+        _cli("record-review.py", db, stdin=rec("npm", "n", "pass", artifacts=True))
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE VIEW passing_reviews AS SELECT package FROM reviews WHERE verdict='pass'")
+        conn.execute("CREATE VIEW artifact_names AS SELECT artifact_name FROM review_artifacts")
+        conn.execute('CREATE VIEW "team ""odd"" name" AS SELECT version FROM reviews')
+        conn.execute("CREATE TABLE inbox (package TEXT)")
+        conn.execute("CREATE VIEW inbox_view AS SELECT package FROM inbox")
+        conn.execute("CREATE TRIGGER inbox_write INSTEAD OF INSERT ON inbox_view"
+                     " BEGIN INSERT INTO inbox VALUES (NEW.package); END")
+        conn.commit()
+        trig_before = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' ORDER BY name").fetchall()
+        views_before = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='view' ORDER BY name").fetchall()
+        conn.close()
+        check("migrate succeeds with views over the rebuilt tables", _migrate(db).returncode, 0)
+        conn = sqlite3.connect(db)
+        check("views kept verbatim",
+              conn.execute("SELECT name, sql FROM sqlite_master WHERE type='view' ORDER BY name").fetchall(),
+              views_before)
+        check("view still reads the rebuilt table", conn.execute("SELECT * FROM passing_reviews").fetchall(), [("n",)])
+        check("every trigger kept, including INSTEAD OF triggers on views",
+              conn.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' ORDER BY name").fetchall(),
+              trig_before)
+        conn.execute("INSERT INTO inbox_view VALUES ('x')")
+        check("INSTEAD OF trigger still works", conn.execute("SELECT package FROM inbox").fetchall(), [("x",)])
+        conn.close()
+
+    # VACUUM runs after COMMIT. If it fails, the migration has still happened:
+    # say so, exit non-zero, and let a rerun finish the VACUUM.
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        _old_db(db, "schema-76f81b1.sql")
+        _cli("record-review.py", db, stdin=rec("npm", "n", "pass", artifacts=True))
+        spec = importlib.util.spec_from_file_location("mig", SCRIPTS / "migrate-ecosystems.py")
+        mig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mig)
+
+        class NoVacuum:
+            def __init__(self, conn):
+                self._c = conn
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+            def execute(self, sql, *a):
+                if sql.strip().upper() == "VACUUM":
+                    raise sqlite3.OperationalError("database or disk is full")
+                return self._c.execute(sql, *a)
+
+        real_connect = mig.sqlite3.connect
+        class FakeSqlite:
+            """The real sqlite3 module, except connect() returns a NoVacuum connection."""
+            def __getattr__(self, name):
+                return getattr(sqlite3, name)
+            @staticmethod
+            def connect(*a, **k):
+                return NoVacuum(real_connect(*a, **k))
+
+        mig.sqlite3 = FakeSqlite()
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = mig.main(["migrate-ecosystems.py", str(db)])
+        check("VACUUM failure exits non-zero", rc, 1)
+        check("VACUUM failure does not claim the database is unchanged", "unchanged" in err.getvalue(), False)
+        check("VACUUM failure says the migration committed", "committed" in err.getvalue(), True)
+        check("tables were migrated despite the VACUUM failure",
+              "'cargo'" in sqlite3.connect(db).execute(
+                  "SELECT sql FROM sqlite_master WHERE name='reviews'").fetchone()[0], True)
+        proc = _migrate(db)
+        check("rerun after a failed VACUUM exits 0", proc.returncode, 0)
+        check("rerun finishes the VACUUM",
+              sqlite3.connect(db).execute("PRAGMA freelist_count").fetchone()[0], 0)
+
+
 def test_resolution_names_the_reviewed_event() -> None:
     """Every open fail event vetoes; resolving one never clears another."""
     section("resolution consent")
@@ -1392,6 +1635,7 @@ def main() -> None:
     test_coverage_source_paths()
     test_guards()
     test_audit_detects()
+    test_audit_sees_sqlite_like_names()
     test_requirements_manifest_fails_closed()
     test_multiple_locks_same_repo_ecosystem()
     test_mixed_source_kinds_fail_closed()
@@ -1411,6 +1655,7 @@ def main() -> None:
     test_uv_partially_hashed_release()
     test_source_read_must_be_boolean()
     test_upgrade_revokes_stale_pass()
+    test_cargo_ecosystem()
 
     print()
     if FAILURES:
