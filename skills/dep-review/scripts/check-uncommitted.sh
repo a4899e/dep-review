@@ -85,6 +85,24 @@ MODIFIED=$(count "SELECT COUNT(*) FROM reviews r JOIN b.reviews b ON ${KEY}
      OR r.reviewed_at IS NOT b.reviewed_at
      OR r.reviewer    IS NOT b.reviewer;")
 
+# Schema objects: tables, indexes and the guard triggers that enforce the fail
+# veto. Rows can all match while a trigger was dropped or a CHECK rewritten
+# (migrate-ecosystems.py rebuilds tables), so compare every object's SQL too.
+SCHEMA_Q="SELECT type||' '||name||' '||ifnull(sql,'') FROM sqlite_master WHERE lower(substr(name,1,7)) <> 'sqlite_' ORDER BY type, name;"
+S_NOW="$(sqlite3 "$DB" "$SCHEMA_Q")"
+S_BASE="$(sqlite3 "$BASE_DB" "$SCHEMA_Q")"
+S_CHANGED=0
+if [[ "$S_NOW" != "$S_BASE" ]]; then
+    S_CHANGED=1
+    S_LIST="$(sqlite3 "$DB" "ATTACH '${BASE_DB}' AS o;
+      SELECT '    now:  '||type||' '||name FROM main.sqlite_master m WHERE lower(substr(name,1,7)) <> 'sqlite_'
+        AND NOT EXISTS (SELECT 1 FROM o.sqlite_master b WHERE b.type=m.type AND b.name=m.name AND b.sql IS m.sql)
+      UNION ALL
+      SELECT '    base: '||type||' '||name FROM o.sqlite_master b WHERE lower(substr(name,1,7)) <> 'sqlite_'
+        AND NOT EXISTS (SELECT 1 FROM main.sqlite_master m WHERE m.type=b.type AND m.name=b.name AND m.sql IS b.sql)
+      ORDER BY 1;")"
+fi
+
 if [[ "$BASE_REF" == "HEAD" ]]; then
     NOUN="uncommitted"
     NEXT="Commit ${DB_REL} and open a PR. State the net row count in the title;
@@ -268,6 +286,12 @@ fi
 echo "  dependency rows added:    ${D_ADDED}"
 echo "  dependency rows removed:  ${D_REMOVED}"
 echo "  dependency rows modified: ${D_MODIFIED}"
+if [[ "$S_CHANGED" -eq 1 ]]; then
+    echo "  schema objects changed (tables, indexes, triggers; definition differs or missing):"
+    echo "$S_LIST"
+else
+    echo "  schema objects:           unchanged"
+fi
 
 if [[ "$ADDED" -eq 0 && "$REMOVED" -eq 0 && "$MODIFIED" -eq 0 \
    && "$A_ADDED" -eq 0 && "$A_REMOVED" -eq 0 && "$A_MODIFIED" -eq 0 \
@@ -277,6 +301,7 @@ if [[ "$ADDED" -eq 0 && "$REMOVED" -eq 0 && "$MODIFIED" -eq 0 \
    && "$V_ADDED" -eq 0 && "$V_REMOVED" -eq 0 \
    && "$D_ADDED" -eq 0 && "$D_REMOVED" -eq 0 && "$D_MODIFIED" -eq 0 \
    && "$R_ADDED" -eq 0 && "$R_REMOVED" -eq 0 && "$R_MODIFIED" -eq 0 \
+   && "$S_CHANGED" -eq 0 \
    && "$GUARD_NOW" == "$GUARD_BASE" ]]; then
     # The audited fields are unchanged, but the file may still differ -- a new
     # inventory_runs row and refreshed snapshot_at timestamps land on every

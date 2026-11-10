@@ -1,6 +1,6 @@
 # dep-review
 
-A Claude Code plugin (also usable as a plain Agent Skill in Codex and other skill-aware agents) that reviews PyPI and npm dependency **source** for supply chain attacks before you install or upgrade, and records every verdict in a SQLite database so each package version is reviewed once.
+A Claude Code plugin (also usable as a plain Agent Skill in Codex and other skill-aware agents) that reviews PyPI and npm dependency **source** for supply chain attacks before you install or upgrade, and records every verdict in a SQLite database so each package version is reviewed once. Hand-made reviews of Rust crates can be recorded too (ecosystem `cargo`); an existing database needs `scripts/migrate-ecosystems.py` once.
 
 It looks for:
 
